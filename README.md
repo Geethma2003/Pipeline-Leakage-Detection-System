@@ -15,5 +15,3 @@ An intelligent, IoT-driven monitoring system designed to detect, verify, and pre
   * Dynamic graph plots tracking live vibration values and flow rates for deep diagnostics.
 
 ---
-
-## 📐 System Architecture & Logic
