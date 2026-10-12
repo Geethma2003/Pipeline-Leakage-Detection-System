@@ -1,9 +1,33 @@
+# Firebase Service Account Credentials & Keys
+firebase_service_account.json
+*.json
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
+!frontend/tsconfig.app.json
+!frontend/tsconfig.node.json
+!frontend/.oxlintrc.json
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+
+# Databases & Persisted Stores
+aquaguard.db
+*.db
+
+# Python & Pytest
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-.env
 .pytest_cache/
+
+# Node & Frontend Build
+node_modules/
+dist/
+.vite/
+
+# Temporary & Scratch
+scratch/

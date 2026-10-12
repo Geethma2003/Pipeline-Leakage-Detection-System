@@ -1,77 +1,93 @@
 /*
- * ESP32 Pipeline Leakage Detection System
- * ---------------------------------------
- * Hardware Architecture:
- * - Microcontroller: ESP32 Dev Module (3.3V Logic)
- * - Sensor 1: Piezoelectric Vibration Transducer on GPIO 34 (ADC1_CH6, Input Only)
- * - Sensor 2: Piezoelectric Vibration Transducer on GPIO 35 (ADC1_CH7, Input Only)
- * - Pipeline: 2.0 Meter Steel Water Pipeline with standard operating pump
- * - Serial Interface: 115200 Baud Rate
+ * ESP32 Pipeline Leakage Detection System - AquaGuard AI
+ * ========================================================
+ * Restored Pre-GPS DSP Vibration-Processing Architecture with GPS Integration
+ * 
+ * Microcontroller: ESP32 Dev Module (3.3V Logic)
+ * Sensor 1 Input:  GPIO 34 (ADC1_CH6)
+ * Sensor 2 Input:  GPIO 35 (ADC1_CH7)
+ * GPS Module:      NEO-6M on Serial2 (RX: GPIO 16, TX: GPIO 17 @ 9600 baud)
+ * Serial Port:     115200 Baud (CSV Machine Protocol & Human Diagnostic)
  *
- * Signal Conditioning Circuit (Mandatory for safe ADC operation):
- * - DC Bias: 100k/100k voltage divider to 3.3V rail with 10uF bypass cap creating ~1.65V mid-rail offset.
- * - AC Coupling: 0.1uF ceramic capacitor in series with piezo positive node.
- * - Discharge/Impedance: 1M resistor across piezo element.
- * - Overvoltage Protection: Dual Schottky clamping diodes (BAT54S or 1N4148) to 3.3V and GND.
- * - Anti-Aliasing LP Filter: 10k resistor + 10nF capacitor (fc = 1.59 kHz).
- *
- * Key Design Principles:
- * 1. 60-Second Windowed Multi-Criteria Analysis (Never judge on single high sample).
- * 2. Independent Sensor Anomaly Detection (S1 can increase 20x while S2 stays baseline due to attenuation).
- * 3. Noise-Aware Robust Baseline (Median, MAD, dynamic thresholds, absolute floors).
- * 4. Sustained Anomaly vs. Transient Spike vs. Sensor Fault Classification.
- * 5. Honest Uncertainty in Localization (Requires cross-correlation quality check; otherwise LOCATION NOT VERIFIED).
+ * Signal Acquisition & DSP Design:
+ * - 2,000 sample pairs captured per 1-second observation at 400 us intervals (~2500 Hz nominal).
+ * - Discard initial 30 points to allow HP filter initialization.
+ * - Digital High-Pass DC Blocker: y = 0.98 * (y + raw - prevRaw).
+ * - RMS = sqrt( sum(y^2) / count ) on HP-filtered AC vibration.
+ * - Difference RMS = sqrt( sum((y - prevY)^2) / count ).
+ * - Peak-to-Peak (P2P) = raw_max - raw_min over 2,000 samples.
+ * - ADC Clipping check (raw <= 4 || raw >= 4091).
+ * - 60-second robust baseline calibration using median, MAD, and robust sigmas.
+ * - Continuous telemetry streaming during calibration fault states (never freezes website).
+ * - GPS parsing isolated to the non-acquisition interval (~0.2s) to prevent sampling jitter.
+ * - 15-field CSV telemetry protocol output every second for full website compatibility.
  */
 
 #include <Arduino.h>
+#include <math.h>
 
 // ============================================================================
-// CONFIGURABLE SYSTEM PARAMETERS & CONSTANTS
+// HARDWARE PINS & PHYSICAL CONSTANTS
 // ============================================================================
 
-// Hardware Pins (ADC1 channels on ESP32, safe from WiFi interference)
-static const uint8_t PIN_SENSOR_1 = 34;
-static const uint8_t PIN_SENSOR_2 = 35;
+constexpr int PIN_S1 = 34;
+constexpr int PIN_S2 = 35;
+constexpr float SENSOR_SPACING_M = 2.0f;
 
-// Sampling Configuration
-static const uint32_t SAMPLE_RATE_HZ       = 1000;      // 1000 Hz sampling per channel
-static const uint32_t SAMPLE_PERIOD_US      = 1000000UL / SAMPLE_RATE_HZ; // 1000 us
-static const uint16_t SAMPLES_PER_SECOND    = 1000;      // 1-second analysis window size
-static const uint16_t MAX_RAW_BUFFER_SIZE  = 1000;      // Samples per second buffer
+// GPS UART2 Configuration
+constexpr uint8_t PIN_GPS_RX = 16;
+constexpr uint8_t PIN_GPS_TX = 17;
+constexpr uint32_t GPS_BAUD = 9600;
 
-// System Timing & Windows
-static const uint16_t CALIBRATION_SECONDS   = 60;        // 60-second baseline calibration
-static const uint16_t ANALYSIS_WINDOW_SEC   = 60;        // 60-second sliding history buffer
-static const uint16_t STABILIZE_SECONDS     = 5;         // Initial power/pump stabilization delay
+// YF-S201 Flow Sensor Configuration (Inlet & Outlet Pulse Inputs)
+constexpr int PIN_FLOW_IN = 25;   // Inlet YF-S201 pulse signal (GPIO 25)
+constexpr int PIN_FLOW_OUT = 26;  // Outlet YF-S201 pulse signal (GPIO 26)
+constexpr float FLOW_K_IN = 450.0f;   // Nominal 450 pulses/liter (independently calibratable)
+constexpr float FLOW_K_OUT = 450.0f;  // Nominal 450 pulses/liter (independently calibratable)
+constexpr uint32_t FLOW_WINDOW_MS = 5000; // 5-second measurement window
+constexpr float FLOW_LEAK_THRESHOLD_LPM = 0.10f; // Configurable flow imbalance threshold (L/min)
+constexpr float FLOW_MIN_INLET_LPM = 0.50f;      // Minimum inlet flow to assess leakage
+constexpr uint8_t FLOW_CONFIRM_WINDOWS = 3;      // 3 consecutive windows to confirm leak (~15s)
+constexpr uint8_t FLOW_RECOVERY_WINDOWS = 3;     // 3 consecutive normal windows to recover
 
-// Anomaly & Persistence Thresholds (Experimental Settings)
-static const uint16_t DEFAULT_PERSISTENCE_SEC = 42;      // 42 out of 60 abnormal seconds required (70%)
-static const uint16_t MIN_CONSECUTIVE_ABN     = 15;      // Minimum consecutive abnormal seconds run length
-static float MAD_MULTIPLIER                   = 3.5f;    // Threshold offset = median + 3.5 * MAD
-static float RMS_FACTOR_MULTIPLIER            = 2.2f;    // Threshold offset = median * 2.2
-static const float MIN_RMS_ABSOLUTE_FLOOR     = 15.0f;   // Minimum threshold floor (ADC counts)
-static const float MIN_P2P_ABSOLUTE_FLOOR    = 40.0f;   // Minimum P2P floor (ADC counts)
+// Sampling Window Constants (~0.7 seconds of RMS sampling, 1750 points)
+constexpr int POINTS = 1750;
+constexpr uint32_t SAMPLE_INTERVAL_US = 400; // 2500 Hz per channel
+constexpr int SECONDS_PER_REPORT = 60;
+constexpr int DISCARD_POINTS = 30; // Allow HP filter to settle
 
-// Transient & Noise Classification Bounds
-static const float MAX_VARIABILITY_RATIO      = 0.48f;   // Max RMS std-dev / mean ratio for sustained noise
-static const float CREST_FACTOR_SPIKE_LIMIT   = 7.0f;    // Crest factor > 7 indicates impulse transient spike
+// High-Speed Synchronized Sampling & TDOA Constants (10 kHz per channel)
+constexpr uint32_t TDOA_SAMPLE_INTERVAL_US = 100; // 100 us = 10 kHz nominal per channel
+constexpr int TDOA_BURST_SAMPLES = 500;           // 500 sample pairs = 50 ms window
+constexpr float PIPE_PROPAGATION_VELOCITY_MPS = 1250.0f; // NOMINAL / UNCALIBRATED wave speed in steel pipe
+constexpr float ADC_INTERCHANNEL_SKEW_ESTIMATE_US = 10.0f; // Nominal estimate of sequential ADC1 conversion delay (subject to electrical calibration)
+constexpr int TDOA_MAX_SEARCH_LAG = 20;           // Lags -20 to +20 (-2000 us to +2000 us)
+constexpr float MIN_TDOA_CORRELATION = 0.65f;
 
-// Hardware & ADC Fault Bounds (12-bit ADC: 0..4095)
-static const float ADC_RAW_MIN_VALID          = 400.0f;  // Lower rail short/disconnection threshold (~0.32V)
-static const float ADC_RAW_MAX_VALID          = 3700.0f; // Upper rail short threshold (~2.98V)
-static const float ADC_FLATLINE_VARIANCE_MIN  = 0.1f;    // Disconnected pin / flatline variance
 
-// Pipeline & Acoustic Localization Constants
-static const float PIPE_LENGTH_METERS        = 2.0f;    // Sensor spacing = 2.0 m
-static const float ACOUSTIC_SPEED_MPS        = 1200.0f; // Nominal speed of sound in water-filled steel pipe (m/s)
-static const float MIN_CORRELATION_PEAK      = 0.65f;   // Minimum cross-correlation coefficient for location trust
+// Baseline Limits (Median & MAD Multipliers)
+constexpr float RMS_RATIO_LIMIT = 1.50f;
+constexpr float DIFF_RATIO_LIMIT = 1.50f;
+constexpr float ROBUST_SIGMAS = 4.0f;
+constexpr float MIN_RMS_RISE = 6.0f;   // ADC counts
+constexpr float MIN_DIFF_RISE = 4.0f;  // ADC counts
+
+// Detection Parameters
+constexpr int MIN_VALID_SECONDS = 50;
+constexpr int SUSTAINED_SECONDS = 42;  // >=70% of 60 seconds
+constexpr int MIN_CONTINUOUS_SECONDS = 12;
+constexpr int INTERMITTENT_SECONDS = 12;
+
+// Cross-Correlation Lag
+constexpr int MAX_LAG_SAMPLES = 8;
+constexpr float MIN_CORRELATION = 0.65f;
+constexpr int MIN_DIRECTION_VOTES = 15;
 
 // ============================================================================
 // DATA STRUCTURES
 // ============================================================================
 
 enum SystemState {
-  STATE_STABILIZING,
   STATE_CALIBRATING,
   STATE_MONITORING_NORMAL,
   STATE_SUSPECTED_ANOMALY,
@@ -79,596 +95,1167 @@ enum SystemState {
   STATE_SENSOR_FAULT
 };
 
-struct SensorFeatures {
-  float mean_raw;
-  float rms;
-  float variance;
-  float p2p;
-  float st_var;         // Short-term variation (mean absolute consecutive difference)
-  float zcr;            // Zero crossing rate (crossings/sec)
-  float crest_factor;
+struct TDOAResult {
+  float delta_t_us = 0.0f;
+  float peak_corr = 0.0f;
+  float psr = 0.0f;
+  float dist_s1_m = 0.0f;
+  float dist_s2_m = 0.0f;
+  float confidence_pct = 0.0f;
+  float uncertainty_m = 0.15f;
+  int sample_rate_hz = 10000;
+  bool loc_valid = false;
+  char status[40] = "LOCATION_UNAVAILABLE";
+  int16_t s1_wave[50];
+  int16_t s2_wave[50];
 };
 
-struct SecondRecord {
-  uint32_t second_index;
-  SensorFeatures s1;
-  SensorFeatures s2;
-  bool s1_abnormal;
-  bool s2_abnormal;
-  bool is_transient;
+struct FlowResult {
+  uint32_t esp32_ms = 0;
+  uint32_t interval_ms = 5000;
+  uint32_t in_pulses = 0;
+  uint32_t out_pulses = 0;
+  float flow_in_lpm = 0.0f;
+  float flow_out_lpm = 0.0f;
+  float flow_diff_lpm = 0.0f;
+  uint8_t leak_progress = 0; // 0..3 windows
+  bool leak_confirmed = false;
+  char status[32] = "NO_FLOW";
 };
 
-struct BaselineProfile {
-  float s1_rms_median;
-  float s1_rms_mad;
-  float s1_p2p_median;
-  float s1_rms_thresh;
-  float s1_p2p_thresh;
-
-  float s2_rms_median;
-  float s2_rms_mad;
-  float s2_p2p_median;
-  float s2_rms_thresh;
-  float s2_p2p_thresh;
-
-  bool is_calibrated;
+struct Observation {
+  float rms1 = 0;
+  float rms2 = 0;
+  float diff1 = 0;
+  float diff2 = 0;
+  float p2p1 = 0;
+  float p2p2 = 0;
+  int minRaw1 = 4095, maxRaw1 = 0;
+  int minRaw2 = 4095, maxRaw2 = 0;
+  float meanRaw1 = 2048.0f;
+  float meanRaw2 = 2048.0f;
+  int s1_clip_count = 0;
+  int s2_clip_count = 0;
+  float s1_clip_pct = 0.0f;
+  float s2_clip_pct = 0.0f;
+  float corr = 0;
+  int lag = 0;
+  bool valid = false;
+  bool high1 = false;
+  bool high2 = false;
+  int late_count = 0;
+  int clipped_count = 0;
+  float effective_hz = 2500.0f;
 };
+
+struct Baseline {
+  float rms1 = 0, rms2 = 0, diff1 = 0, diff2 = 0;
+  float thresholdRms1 = 0, thresholdRms2 = 0;
+  float thresholdDiff1 = 0, thresholdDiff2 = 0;
+  bool ready = false;
+};
+
 
 // ============================================================================
 // GLOBAL STATE & BUFFERS
 // ============================================================================
 
-SystemState g_system_state = STATE_STABILIZING;
-BaselineProfile g_baseline = {0};
+float signal1[POINTS];
+float signal2[POINTS];
 
-// Raw 1-second sample buffers (used for DSP feature calculation & cross-correlation)
-float g_s1_raw_window[SAMPLES_PER_SECOND];
-float g_s2_raw_window[SAMPLES_PER_SECOND];
-uint16_t g_sample_count = 0;
+Observation minuteData[SECONDS_PER_REPORT];
+Baseline base;
 
-// 60-Second Circular History Buffer
-SecondRecord g_history[ANALYSIS_WINDOW_SEC];
-uint16_t g_history_count = 0;
-uint16_t g_history_head  = 0;
+SystemState g_system_state = STATE_CALIBRATING;
+unsigned long g_minute_number = 0;
+unsigned long g_total_seconds_elapsed = 0;
 
-// Calibration accumulator arrays (60 entries)
-float g_cal_s1_rms[CALIBRATION_SECONDS];
-float g_cal_s1_p2p[CALIBRATION_SECONDS];
-float g_cal_s2_rms[CALIBRATION_SECONDS];
-float g_cal_s2_p2p[CALIBRATION_SECONDS];
-uint16_t g_cal_index = 0;
+bool g_csv_mode = true;
+bool g_verbose_mode = true;
+bool g_gps_enabled = true;
+int g_persistence_req = SUSTAINED_SECONDS;
 
-// Diagnostics & Timing Performance Metrics
-uint32_t g_total_seconds_elapsed = 0;
-uint32_t g_timing_overrun_count  = 0;
-uint32_t g_last_sample_us        = 0;
-bool     g_verbose_mode          = true;
-bool     g_csv_mode              = false;
-uint16_t g_persistence_req       = DEFAULT_PERSISTENCE_SEC;
+// GPS State
+float g_gps_lat = 0.0f;
+float g_gps_lon = 0.0f;
+uint8_t g_gps_sats = 0;
+float g_gps_hdop = 99.99f;
+bool g_gps_has_fix = false;
+uint32_t g_last_gps_fix_ms = 0;
+char g_nmea_line_buf[128];
+uint8_t g_nmea_buf_idx = 0;
 
-// Alarm hysteresis tracker
-uint16_t g_normal_windows_in_alarm = 0;
+Observation g_last_obs;
+
+// ============================================================================
+// FLOW PULSE COUNTERS, CRITICAL MUX & TDOA CANDIDATE RING BUFFER
+// ============================================================================
+volatile uint32_t g_inlet_pulses = 0;
+volatile uint32_t g_outlet_pulses = 0;
+portMUX_TYPE g_flow_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void IRAM_ATTR flowInletISR() {
+  portENTER_CRITICAL_ISR(&g_flow_mux);
+  g_inlet_pulses++;
+  portEXIT_CRITICAL_ISR(&g_flow_mux);
+}
+
+void IRAM_ATTR flowOutletISR() {
+  portENTER_CRITICAL_ISR(&g_flow_mux);
+  g_outlet_pulses++;
+  portEXIT_CRITICAL_ISR(&g_flow_mux);
+}
+
+FlowResult g_latest_flow;
+uint32_t g_last_flow_calc_ms = 0;
+uint8_t g_flow_leak_count = 0;
+uint8_t g_flow_normal_count = 0;
+bool g_flow_leak_alarm = false;
+uint32_t g_flow_imbalance_onset_ms = 0;
+
+// Candidate Vibration TDOA Buffer (30 elements = 30 seconds of history)
+constexpr int TDOA_HISTORY_SIZE = 30;
+TDOAResult g_tdoa_history[TDOA_HISTORY_SIZE];
+uint32_t g_tdoa_history_ts[TDOA_HISTORY_SIZE];
+int g_tdoa_history_idx = 0;
+int g_tdoa_history_count = 0;
+
+// Associated Candidate Acoustic Lock when leak confirmed
+TDOAResult g_associated_tdoa_lock;
+bool g_associated_tdoa_valid = false;
+
+// ============================================================================
+// STATIC BUFFERS IN BSS (Off-stack storage to prevent FreeRTOS loopTask stack canary panic)
+// ============================================================================
+static int16_t   s_tdoa_raw1[TDOA_BURST_SAMPLES];
+static int16_t   s_tdoa_raw2[TDOA_BURST_SAMPLES];
+static float     s_tdoa_filt1[TDOA_BURST_SAMPLES];
+static float     s_tdoa_filt2[TDOA_BURST_SAMPLES];
+static float     s_tdoa_r_vals[2 * TDOA_MAX_SEARCH_LAG + 1];
+static TDOAResult s_tdoa_result;
+
+// Reusable static analysis buffers (replaces 1KB+ stack arrays in calibrate, analyzeMinute, medianOf)
+static float s_analysis_r1[SECONDS_PER_REPORT];
+static float s_analysis_r2[SECONDS_PER_REPORT];
+static float s_analysis_d1[SECONDS_PER_REPORT];
+static float s_analysis_d2[SECONDS_PER_REPORT];
+static bool  s_analysis_a1[SECONDS_PER_REPORT];
+static bool  s_analysis_a2[SECONDS_PER_REPORT];
+static float s_median_temp[SECONDS_PER_REPORT];
+static float s_baseline_deviations[SECONDS_PER_REPORT];
 
 // ============================================================================
 // FUNCTION DECLARATIONS
 // ============================================================================
 
-void processSample(uint16_t s1_adc, uint16_t s2_adc);
-SensorFeatures computeFeatures(const float* buffer, uint16_t length);
-void computeBaselineStatistics();
-void evaluateCurrentSecond(SensorFeatures f1, SensorFeatures f2);
-void analyze60SecondWindow();
-void performCrossCorrelationLocalization(float* tdoa_sec_out, float* peak_corr_out, bool* valid_out);
+void sortFloats(float *a, int n);
+float medianOf(const float *values, int n);
+float baselineLimit(const float *values, int n, float ratio, float minimumIncrease, float &center);
+Observation captureObservation();
+void estimateDirection(Observation &o);
+const TDOAResult& captureHighSpeedTDOA();
+void calibrate();
+void analyzeMinute();
+void readGPS();
+void parseNMEASentence(char* line);
+void printGPSTelemetry();
+void printADCDiagnostics();
+void printADCTelemetry(const Observation &o);
 void handleSerialCommands();
 void printHelp();
 void printStatusReport();
-void printFull60SecondReport(const char* state_str, uint16_t s1_abn, uint16_t s2_abn, 
-                             uint16_t s1_max_seq, uint16_t s2_max_seq, 
-                             float s1_med_rms, float s2_med_rms,
-                             float s1_var_ratio, float s2_var_ratio,
-                             float tdoa_sec, float peak_corr, bool loc_valid,
+void printFull60SecondReport(const char* state_str, int valid, int invalid,
+                             float medR1, float medR2, float medD1, float medD2,
+                             int count1, int count2, int simultaneous,
+                             int strongCorr, int lead1, int lead2,
                              const char* reasoning);
-float calculateMedian(float* array, uint16_t size);
-float calculateMAD(float* array, uint16_t size, float median);
+void printMemoryDiagnostics(const char* tag);
+void printProgressMarker(const char* stage, uint32_t elapsed_us = 0);
+void evaluateFlowSensors();
+void printFlowTelemetry(const FlowResult &f);
+void printFlowDiagnostics();
+void recordTDOAHistory(const TDOAResult &t);
+void associateCandidateTDOALock();
 
 // ============================================================================
-// ARDUINO SETUP
+// HELPER FUNCTIONS & RUNTIME DIAGNOSTICS
 // ============================================================================
 
-void setup() {
-  Serial.begin(115200);
-  while (!Serial && millis() < 3000); // Wait for Serial Monitor
-
-  analogReadResolution(12); // ESP32 12-bit ADC (0..4095)
-  
-  // Set GPIO pin modes explicitly
-  pinMode(PIN_SENSOR_1, INPUT);
-  pinMode(PIN_SENSOR_2, INPUT);
-
-  Serial.println(F("\n=================================================="));
-  Serial.println(F("    ESP32 PIPELINE LEAKAGE DETECTION SYSTEM      "));
-  Serial.println(F("=================================================="));
-  Serial.printf("Sensors: GPIO %d (S1), GPIO %d (S2)\n", PIN_SENSOR_1, PIN_SENSOR_2);
-  Serial.printf("Sampling Rate: %d Hz | Window: %d Sec\n", SAMPLE_RATE_HZ, ANALYSIS_WINDOW_SEC);
-  Serial.println(F("Type 'H' or 'HELP' for serial command menu."));
-  Serial.println(F("==================================================\n"));
-
-  g_last_sample_us = micros();
+void printMemoryDiagnostics(const char* tag) {
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t minHeap = ESP.getMinFreeHeap();
+  UBaseType_t stackRemain = uxTaskGetStackHighWaterMark(NULL);
+  Serial.printf("[MEM-CHECK @ %s] FreeHeap: %lu B | MinHeap: %lu B | StackHighWater: %u B\n",
+                tag, (unsigned long)freeHeap, (unsigned long)minHeap, (unsigned int)stackRemain);
 }
 
-// ============================================================================
-// ARDUINO MAIN LOOP
-// ============================================================================
-
-void loop() {
-  // Handle user input over Serial
-  handleSerialCommands();
-
-  // Precise sampling clock check
-  uint32_t now_us = micros();
-  if (now_us - g_last_sample_us >= SAMPLE_PERIOD_US) {
-    if (now_us - g_last_sample_us > (SAMPLE_PERIOD_US + 150)) {
-      g_timing_overrun_count++;
-    }
-    g_last_sample_us += SAMPLE_PERIOD_US;
-
-    // Read ADC channels
-    uint16_t raw_s1 = analogRead(PIN_SENSOR_1);
-    uint16_t raw_s2 = analogRead(PIN_SENSOR_2);
-
-    processSample(raw_s1, raw_s2);
-  }
-}
-
-// ============================================================================
-// SIGNAL PROCESSING & WINDOW MANAGEMENT
-// ============================================================================
-
-void processSample(uint16_t s1_adc, uint16_t s2_adc) {
-  g_s1_raw_window[g_sample_count] = (float)s1_adc;
-  g_s2_raw_window[g_sample_count] = (float)s2_adc;
-  g_sample_count++;
-
-  // When a full 1-second window (1000 samples) is collected:
-  if (g_sample_count >= SAMPLES_PER_SECOND) {
-    g_total_seconds_elapsed++;
-
-    // Compute DSP features for both channels
-    SensorFeatures f1 = computeFeatures(g_s1_raw_window, SAMPLES_PER_SECOND);
-    SensorFeatures f2 = computeFeatures(g_s2_raw_window, SAMPLES_PER_SECOND);
-
-    // Reset sample index for next second
-    g_sample_count = 0;
-
-    // Execute state logic
-    switch (g_system_state) {
-      case STATE_STABILIZING: {
-        if (g_csv_mode) {
-          Serial.printf("LOG,%lu,%u,STABILIZING,0,0,0,0,0,0\n", millis(), g_total_seconds_elapsed);
-        } else if (g_verbose_mode) {
-          Serial.printf("[STABILIZING %u/%d] S1 ADC Mean: %.1f | S2 ADC Mean: %.1f\n", 
-                        g_total_seconds_elapsed, STABILIZE_SECONDS, f1.mean_raw, f2.mean_raw);
-        }
-        if (g_total_seconds_elapsed >= STABILIZE_SECONDS) {
-          g_system_state = STATE_CALIBRATING;
-          g_cal_index = 0;
-          Serial.println(F("\n>>> PUMP STABILIZED. STARTING 60-SECOND NO-LEAK BASELINE CALIBRATION... <<<"));
-          Serial.println(F("Ensure pipeline is operating normally with pump ON and NO LEAK present.\n"));
-        }
-        break;
-      }
-
-      case STATE_CALIBRATING: {
-        g_cal_s1_rms[g_cal_index] = f1.rms;
-        g_cal_s1_p2p[g_cal_index] = f1.p2p;
-        g_cal_s2_rms[g_cal_index] = f2.rms;
-        g_cal_s2_p2p[g_cal_index] = f2.p2p;
-        g_cal_index++;
-
-        if (g_csv_mode) {
-          Serial.printf("CAL,%lu,%u,%.2f,%.2f,%.2f,%.2f\n", 
-                        millis(), g_cal_index, f1.rms, f1.p2p, f2.rms, f2.p2p);
-        } else if (g_verbose_mode) {
-          Serial.printf("[CALIBRATING %u/%d] S1 RMS: %.2f P2P: %.1f | S2 RMS: %.2f P2P: %.1f\n",
-                        g_cal_index, CALIBRATION_SECONDS, f1.rms, f1.p2p, f2.rms, f2.p2p);
-        }
-
-        if (g_cal_index >= CALIBRATION_SECONDS) {
-          computeBaselineStatistics();
-          g_system_state = STATE_MONITORING_NORMAL;
-          g_history_count = 0;
-          g_history_head  = 0;
-          Serial.println(F("\n>>> CALIBRATION COMPLETE. ENTERING REAL-TIME MONITORING MODE. <<<\n"));
-        }
-        break;
-      }
-
-      case STATE_MONITORING_NORMAL:
-      case STATE_SUSPECTED_ANOMALY:
-      case STATE_CONFIRMED_LEAK_ALARM:
-      case STATE_SENSOR_FAULT: {
-        evaluateCurrentSecond(f1, f2);
-        break;
-      }
-    }
-  }
-}
-
-// Compute per-window statistical & DSP features (DC-removed RMS, variance, P2P, ZCR, ST-Var)
-SensorFeatures computeFeatures(const float* buffer, uint16_t length) {
-  SensorFeatures feat = {0};
-  if (length == 0) return feat;
-
-  // 1. Compute Raw Mean (DC Offset)
-  double sum = 0.0;
-  float max_val = buffer[0];
-  float min_val = buffer[0];
-
-  for (uint16_t i = 0; i < length; i++) {
-    float val = buffer[i];
-    sum += val;
-    if (val > max_val) max_val = val;
-    if (val < min_val) min_val = val;
-  }
-  feat.mean_raw = (float)(sum / length);
-  feat.p2p = max_val - min_val;
-
-  // 2. DC Removal and Variance/RMS computation
-  double sq_sum = 0.0;
-  double diff_sum = 0.0;
-  uint32_t zero_crossings = 0;
-
-  float prev_ac = buffer[0] - feat.mean_raw;
-
-  for (uint16_t i = 0; i < length; i++) {
-    float ac_val = buffer[i] - feat.mean_raw;
-    sq_sum += (double)ac_val * (double)ac_val;
-
-    if (i > 0) {
-      diff_sum += fabsf(buffer[i] - buffer[i - 1]);
-      if ((prev_ac < 0.0f && ac_val >= 0.0f) || (prev_ac >= 0.0f && ac_val < 0.0f)) {
-        zero_crossings++;
-      }
-    }
-    prev_ac = ac_val;
-  }
-
-  feat.variance = (float)(sq_sum / length);
-  feat.rms = sqrtf(feat.variance);
-  feat.st_var = (float)(diff_sum / (length - 1));
-  feat.zcr = (float)zero_crossings;
-
-  float peak_ac = fabsf(max_val - feat.mean_raw) > fabsf(min_val - feat.mean_raw) ?
-                  fabsf(max_val - feat.mean_raw) : fabsf(min_val - feat.mean_raw);
-  feat.crest_factor = (feat.rms > 0.001f) ? (peak_ac / feat.rms) : 0.0f;
-
-  return feat;
-}
-
-// Compute dynamic baseline thresholds using median & MAD
-void computeBaselineStatistics() {
-  // Compute Sensor 1 RMS baseline statistics
-  float s1_rms_temp[CALIBRATION_SECONDS];
-  float s1_p2p_temp[CALIBRATION_SECONDS];
-  float s2_rms_temp[CALIBRATION_SECONDS];
-  float s2_p2p_temp[CALIBRATION_SECONDS];
-
-  for (uint16_t i = 0; i < CALIBRATION_SECONDS; i++) {
-    s1_rms_temp[i] = g_cal_s1_rms[i];
-    s1_p2p_temp[i] = g_cal_s1_p2p[i];
-    s2_rms_temp[i] = g_cal_s2_rms[i];
-    s2_p2p_temp[i] = g_cal_s2_p2p[i];
-  }
-
-  g_baseline.s1_rms_median = calculateMedian(s1_rms_temp, CALIBRATION_SECONDS);
-  g_baseline.s1_rms_mad    = calculateMAD(g_cal_s1_rms, CALIBRATION_SECONDS, g_baseline.s1_rms_median);
-  g_baseline.s1_p2p_median = calculateMedian(s1_p2p_temp, CALIBRATION_SECONDS);
-
-  g_baseline.s2_rms_median = calculateMedian(s2_rms_temp, CALIBRATION_SECONDS);
-  g_baseline.s2_rms_mad    = calculateMAD(g_cal_s2_rms, CALIBRATION_SECONDS, g_baseline.s2_rms_median);
-  g_baseline.s2_p2p_median = calculateMedian(s2_p2p_temp, CALIBRATION_SECONDS);
-
-  // Compute noise-aware dynamic thresholds with absolute safety floor
-  float s1_t1 = g_baseline.s1_rms_median + (MAD_MULTIPLIER * g_baseline.s1_rms_mad);
-  float s1_t2 = g_baseline.s1_rms_median * RMS_FACTOR_MULTIPLIER;
-  g_baseline.s1_rms_thresh = max(max(s1_t1, s1_t2), MIN_RMS_ABSOLUTE_FLOOR);
-  g_baseline.s1_p2p_thresh = max(g_baseline.s1_p2p_median * 2.5f, MIN_P2P_ABSOLUTE_FLOOR);
-
-  float s2_t1 = g_baseline.s2_rms_median + (MAD_MULTIPLIER * g_baseline.s2_rms_mad);
-  float s2_t2 = g_baseline.s2_rms_median * RMS_FACTOR_MULTIPLIER;
-  g_baseline.s2_rms_thresh = max(max(s2_t1, s2_t2), MIN_RMS_ABSOLUTE_FLOOR);
-  g_baseline.s2_p2p_thresh = max(g_baseline.s2_p2p_median * 2.5f, MIN_P2P_ABSOLUTE_FLOOR);
-
-  g_baseline.is_calibrated = true;
-
-  Serial.println(F("---------------- CALIBRATION RESULTS ----------------"));
-  Serial.printf("Sensor 1 Baseline RMS Median: %.2f | MAD: %.2f | Dynamic Thresh: %.2f\n", 
-                g_baseline.s1_rms_median, g_baseline.s1_rms_mad, g_baseline.s1_rms_thresh);
-  Serial.printf("Sensor 2 Baseline RMS Median: %.2f | MAD: %.2f | Dynamic Thresh: %.2f\n", 
-                g_baseline.s2_rms_median, g_baseline.s2_rms_mad, g_baseline.s2_rms_thresh);
-  Serial.println(F("----------------------------------------------------\n"));
-}
-
-// Evaluate each 1-second record, mark preliminary flags, add to circular buffer
-void evaluateCurrentSecond(SensorFeatures f1, SensorFeatures f2) {
-  // Hardware Fault Check
-  bool hardware_fault = false;
-  if (f1.mean_raw < ADC_RAW_MIN_VALID || f1.mean_raw > ADC_RAW_MAX_VALID ||
-      f2.mean_raw < ADC_RAW_MIN_VALID || f2.mean_raw > ADC_RAW_MAX_VALID ||
-      f1.variance < ADC_FLATLINE_VARIANCE_MIN || f2.variance < ADC_FLATLINE_VARIANCE_MIN) {
-    hardware_fault = true;
-    g_system_state = STATE_SENSOR_FAULT;
-  }
-
-  // Single-second threshold comparison
-  bool s1_abn = (f1.rms > g_baseline.s1_rms_thresh);
-  bool s2_abn = (f2.rms > g_baseline.s2_rms_thresh);
-
-  // Transient impulse spike check (high P2P / crest factor but non-sustained)
-  bool transient = (f1.crest_factor > CREST_FACTOR_SPIKE_LIMIT || f2.crest_factor > CREST_FACTOR_SPIKE_LIMIT ||
-                    (f1.p2p > g_baseline.s1_p2p_thresh && !s1_abn) ||
-                    (f2.p2p > g_baseline.s2_p2p_thresh && !s2_abn));
-
-  // Store into 60-second circular buffer
-  SecondRecord rec;
-  rec.second_index = g_total_seconds_elapsed;
-  rec.s1 = f1;
-  rec.s2 = f2;
-  rec.s1_abnormal = s1_abn;
-  rec.s2_abnormal = s2_abn;
-  rec.is_transient = transient;
-
-  g_history[g_history_head] = rec;
-  g_history_head = (g_history_head + 1) % ANALYSIS_WINDOW_SEC;
-  if (g_history_count < ANALYSIS_WINDOW_SEC) {
-    g_history_count++;
-  }
-
-  // Live 1-second diagnostic line (Explicitly marked as PRELIMINARY)
-  if (g_csv_mode) {
-    Serial.printf("CSV,%lu,%lu,%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%s\n",
-                  millis(), rec.second_index,
-                  f1.rms, f1.p2p, f1.variance, f1.st_var,
-                  f2.rms, f2.p2p, f2.variance, f2.st_var,
-                  s1_abn ? 1 : 0, s2_abn ? 1 : 0, transient ? 1 : 0,
-                  hardware_fault ? "FAULT" : ((s1_abn || s2_abn) ? "PRELIM_ABNORMAL" : "PRELIM_NORMAL"));
-  } else if (g_verbose_mode) {
-    const char* prelim_status = hardware_fault ? "[FAULT]" : 
-                               (s1_abn && s2_abn) ? "[PRELIM ABNORMAL: S1+S2]" :
-                               s1_abn ? "[PRELIM ABNORMAL: S1 ONLY]" :
-                               s2_abn ? "[PRELIM ABNORMAL: S2 ONLY]" :
-                               transient ? "[PRELIM TRANSIENT SPIKE]" : "[PRELIM NORMAL]";
-
-    Serial.printf("[LIVE-DIAG %02u/%d] S1 RMS: %5.1f (Th: %5.1f) | S2 RMS: %5.1f (Th: %5.1f) %s\n",
-                  g_history_count, ANALYSIS_WINDOW_SEC,
-                  f1.rms, g_baseline.s1_rms_thresh,
-                  f2.rms, g_baseline.s2_rms_thresh,
-                  prelim_status);
-  }
-
-  // Trigger 60-Second Comprehensive Decision Evaluation
-  if (g_history_count >= ANALYSIS_WINDOW_SEC && (g_total_seconds_elapsed % ANALYSIS_WINDOW_SEC == 0)) {
-    analyze60SecondWindow();
-  }
-}
-
-// ============================================================================
-// 60-SECOND COMPREHENSIVE MULTI-CRITERIA EVALUATION ENGINE
-// ============================================================================
-
-void analyze60SecondWindow() {
-  uint16_t s1_abn_count = 0;
-  uint16_t s2_abn_count = 0;
-  uint16_t transient_count = 0;
-
-  uint16_t s1_consec = 0, s1_max_consec = 0;
-  uint16_t s2_consec = 0, s2_max_consec = 0;
-
-  float s1_rms_vals[ANALYSIS_WINDOW_SEC];
-  float s2_rms_vals[ANALYSIS_WINDOW_SEC];
-
-  float s1_rms_sum = 0.0f, s2_rms_sum = 0.0f;
-
-  for (uint16_t i = 0; i < ANALYSIS_WINDOW_SEC; i++) {
-    SecondRecord r = g_history[i];
-    s1_rms_vals[i] = r.s1.rms;
-    s2_rms_vals[i] = r.s2.rms;
-    s1_rms_sum += r.s1.rms;
-    s2_rms_sum += r.s2.rms;
-
-    if (r.s1_abnormal) {
-      s1_abn_count++;
-      s1_consec++;
-      if (s1_consec > s1_max_consec) s1_max_consec = s1_consec;
+void printProgressMarker(const char* stage, uint32_t elapsed_us) {
+  if (g_verbose_mode || g_total_seconds_elapsed <= 2) {
+    if (elapsed_us > 0) {
+      Serial.printf("[STAGE: %s] (%lu us)\n", stage, (unsigned long)elapsed_us);
     } else {
-      s1_consec = 0;
+      Serial.printf("[STAGE: %s]\n", stage);
     }
-
-    if (r.s2_abnormal) {
-      s2_abn_count++;
-      s2_consec++;
-      if (s2_consec > s2_max_consec) s2_max_consec = s2_consec;
-    } else {
-      s2_consec = 0;
-    }
-
-    if (r.is_transient) transient_count++;
-  }
-
-  // Window Summary Statistics
-  float s1_med_rms = calculateMedian(s1_rms_vals, ANALYSIS_WINDOW_SEC);
-  float s2_med_rms = calculateMedian(s2_rms_vals, ANALYSIS_WINDOW_SEC);
-
-  float s1_mean_rms = s1_rms_sum / ANALYSIS_WINDOW_SEC;
-  float s2_mean_rms = s2_rms_sum / ANALYSIS_WINDOW_SEC;
-
-  // Calculate Noise Variability Ratio (Standard Deviation / Mean)
-  float s1_sq_diff = 0.0f, s2_sq_diff = 0.0f;
-  for (uint16_t i = 0; i < ANALYSIS_WINDOW_SEC; i++) {
-    s1_sq_diff += (s1_rms_vals[i] - s1_mean_rms) * (s1_rms_vals[i] - s1_mean_rms);
-    s2_sq_diff += (s2_rms_vals[i] - s2_mean_rms) * (s2_rms_vals[i] - s2_mean_rms);
-  }
-  float s1_std = sqrtf(s1_sq_diff / ANALYSIS_WINDOW_SEC);
-  float s2_std = sqrtf(s2_sq_diff / ANALYSIS_WINDOW_SEC);
-
-  float s1_var_ratio = (s1_mean_rms > 0.001f) ? (s1_std / s1_mean_rms) : 0.0f;
-  float s2_var_ratio = (s2_mean_rms > 0.001f) ? (s2_std / s2_mean_rms) : 0.0f;
-
-  // Cross-Correlation Localization Check
-  float tdoa_sec = 0.0f, peak_corr = 0.0f;
-  bool  loc_valid = false;
-  performCrossCorrelationLocalization(&tdoa_sec, &peak_corr, &loc_valid);
-
-  // DECISION MATRIX
-  // 1. Hardware / Sensor Fault
-  if (g_system_state == STATE_SENSOR_FAULT) {
-    printFull60SecondReport("SENSOR OR CALIBRATION FAULT",
-                            s1_abn_count, s2_abn_count, s1_max_consec, s2_max_consec,
-                            s1_med_rms, s2_med_rms, s1_var_ratio, s2_var_ratio,
-                            tdoa_sec, peak_corr, false,
-                            "ADC voltage out of bounds or signal flatline detected.");
-    return;
-  }
-
-  // 2. Sustained Anomaly Criteria Check (EITHER SENSOR RULE)
-  // Sensor 1 OR Sensor 2 exhibits persistent elevation over 42/60s AND sustained run length
-  bool s1_sustained = (s1_abn_count >= g_persistence_req) && (s1_max_consec >= MIN_CONSECUTIVE_ABN) && (s1_var_ratio <= MAX_VARIABILITY_RATIO);
-  bool s2_sustained = (s2_abn_count >= g_persistence_req) && (s2_max_consec >= MIN_CONSECUTIVE_ABN) && (s2_var_ratio <= MAX_VARIABILITY_RATIO);
-
-  if (s1_sustained || s2_sustained) {
-    // Lock system in anomaly state (Baseline adaptation IS FROZEN)
-    g_system_state = STATE_CONFIRMED_LEAK_ALARM;
-    g_normal_windows_in_alarm = 0;
-
-    String reasoning = "SUSTAINED ANOMALY DETECTED: ";
-    if (s1_sustained && s2_sustained) {
-      reasoning += "Both S1 and S2 show continuous vibration elevation (>=" + String(g_persistence_req) + "/60s).";
-    } else if (s1_sustained) {
-      reasoning += "Sensor 1 elevated (" + String(s1_abn_count) + "/60s, " + String((int)(s1_med_rms/g_baseline.s1_rms_median)) + "x increase) while Sensor 2 near baseline. Consistent with high acoustic attenuation in pipeline.";
-    } else {
-      reasoning += "Sensor 2 elevated (" + String(s2_abn_count) + "/60s, " + String((int)(s2_med_rms/g_baseline.s2_rms_median)) + "x increase) while Sensor 1 near baseline.";
-    }
-
-    printFull60SecondReport("SUSTAINED VIBRATION ANOMALY / POSSIBLE LEAK",
-                            s1_abn_count, s2_abn_count, s1_max_consec, s2_max_consec,
-                            s1_med_rms, s2_med_rms, s1_var_ratio, s2_var_ratio,
-                            tdoa_sec, peak_corr, loc_valid,
-                            reasoning.c_str());
-  }
-  // 3. Transient Disturbance Check (Spikes, pump speed changes, short tapping)
-  else if ((s1_abn_count >= 10 || s2_abn_count >= 10) || transient_count > 12 || 
-           s1_var_ratio > MAX_VARIABILITY_RATIO || s2_var_ratio > MAX_VARIABILITY_RATIO) {
-    
-    // If we were previously in ALARM state, check hysteresis before clearing
-    if (g_system_state == STATE_CONFIRMED_LEAK_ALARM) {
-      g_normal_windows_in_alarm++;
-      if (g_normal_windows_in_alarm >= 2) {
-        g_system_state = STATE_MONITORING_NORMAL;
-        g_normal_windows_in_alarm = 0;
-      }
-    }
-
-    String reasoning = "TRANSIENT DISTURBANCE: ";
-    if (s1_var_ratio > MAX_VARIABILITY_RATIO || s2_var_ratio > MAX_VARIABILITY_RATIO) {
-      reasoning += "High vibration variability (std/mean > 0.48) indicates pump speed fluctuation, valve operation, or mechanical handling noise.";
-    } else {
-      reasoning += "Short-duration spikes (" + String(transient_count) + " transient seconds) without 60s sustained duration.";
-    }
-
-    printFull60SecondReport("TRANSIENT DISTURBANCE",
-                            s1_abn_count, s2_abn_count, s1_max_consec, s2_max_consec,
-                            s1_med_rms, s2_med_rms, s1_var_ratio, s2_var_ratio,
-                            tdoa_sec, peak_corr, false,
-                            reasoning.c_str());
-  }
-  // 4. Normal Pipeline Operation
-  else {
-    if (g_system_state == STATE_CONFIRMED_LEAK_ALARM) {
-      g_normal_windows_in_alarm++;
-      if (g_normal_windows_in_alarm >= 2) {
-        g_system_state = STATE_MONITORING_NORMAL;
-        g_normal_windows_in_alarm = 0;
-      }
-    } else {
-      g_system_state = STATE_MONITORING_NORMAL;
-    }
-
-    printFull60SecondReport("NORMAL",
-                            s1_abn_count, s2_abn_count, s1_max_consec, s2_max_consec,
-                            s1_med_rms, s2_med_rms, s1_var_ratio, s2_var_ratio,
-                            tdoa_sec, peak_corr, false,
-                            "Vibration levels within baseline statistical bounds across full 60s window.");
   }
 }
 
-// Perform discrete TDOA cross-correlation on the last collected 1-second raw waveform
-void performCrossCorrelationLocalization(float* tdoa_sec_out, float* peak_corr_out, bool* valid_out) {
-  *tdoa_sec_out = 0.0f;
-  *peak_corr_out = 0.0f;
-  *valid_out = false;
-
-  // Zero-mean the 1-second raw arrays
-  double s1_sum = 0, s2_sum = 0;
-  for (uint16_t i = 0; i < SAMPLES_PER_SECOND; i++) {
-    s1_sum += g_s1_raw_window[i];
-    s2_sum += g_s2_raw_window[i];
+void sortFloats(float *a, int n) {
+  for (int i = 1; i < n; ++i) {
+    float v = a[i];
+    int j = i - 1;
+    while (j >= 0 && a[j] > v) {
+      a[j + 1] = a[j];
+      --j;
+    }
+    a[j + 1] = v;
   }
-  float s1_m = (float)(s1_sum / SAMPLES_PER_SECOND);
-  float s2_m = (float)(s2_sum / SAMPLES_PER_SECOND);
+}
 
-  double s1_energy = 0, s2_energy = 0;
-  for (uint16_t i = 0; i < SAMPLES_PER_SECOND; i++) {
-    float x1 = g_s1_raw_window[i] - s1_m;
-    float x2 = g_s2_raw_window[i] - s2_m;
-    s1_energy += x1 * x1;
-    s2_energy += x2 * x2;
+float medianOf(const float *values, int n) {
+  if (n <= 0) return 0;
+  int count = (n > SECONDS_PER_REPORT) ? SECONDS_PER_REPORT : n;
+  for (int i = 0; i < count; ++i) s_median_temp[i] = values[i];
+  sortFloats(s_median_temp, count);
+  return (count % 2) ? s_median_temp[count / 2] : 0.5f * (s_median_temp[count / 2 - 1] + s_median_temp[count / 2]);
+}
+
+float baselineLimit(const float *values, int n,
+                    float ratio, float minimumIncrease, float &center) {
+  center = medianOf(values, n);
+  int count = (n > SECONDS_PER_REPORT) ? SECONDS_PER_REPORT : n;
+  for (int i = 0; i < count; ++i) s_baseline_deviations[i] = fabsf(values[i] - center);
+  float robustSigma = 1.4826f * medianOf(s_baseline_deviations, count);
+  float a = center * ratio;
+  float b = center + ROBUST_SIGMAS * robustSigma;
+  float c = center + minimumIncrease;
+  return fmaxf(a, fmaxf(b, c));
+}
+
+int longestRun(bool *flags) {
+  int best = 0, run = 0;
+  for (int i = 0; i < SECONDS_PER_REPORT; ++i) {
+    run = flags[i] ? run + 1 : 0;
+    if (run > best) best = run;
+  }
+  return best;
+}
+
+// ============================================================================
+// VIBRATION SIGNAL ACQUISITION & DIAGNOSTICS
+// ============================================================================
+
+Observation captureObservation() {
+  Observation result;
+  float prevRaw1 = 0, prevRaw2 = 0;
+  float previousY1 = 0, previousY2 = 0;
+  float y1 = 0, y2 = 0;
+  double sum1 = 0, sum2 = 0, delta1 = 0, delta2 = 0;
+  long sumRaw1 = 0, sumRaw2 = 0;
+  int used = 0, deltasUsed = 0;
+  int late = 0, clipped = 0;
+  int s1_clips = 0, s2_clips = 0;
+  int minRaw1 = 4095, maxRaw1 = 0;
+  int minRaw2 = 4095, maxRaw2 = 0;
+
+  uint32_t start_us = micros();
+  uint32_t next = start_us;
+
+  for (int i = 0; i < POINTS; ++i) {
+    while ((int32_t)(micros() - next) < 0) { }
+    uint32_t now = micros();
+    if ((int32_t)(now - next) > (int32_t)(SAMPLE_INTERVAL_US / 2)) late++;
+    next += SAMPLE_INTERVAL_US;
+
+    int raw1 = analogRead(PIN_S1);
+    int raw2 = analogRead(PIN_S2);
+
+    sumRaw1 += raw1;
+    sumRaw2 += raw2;
+
+    if (raw1 < minRaw1) minRaw1 = raw1;
+    if (raw1 > maxRaw1) maxRaw1 = raw1;
+    if (raw2 < minRaw2) minRaw2 = raw2;
+    if (raw2 > maxRaw2) maxRaw2 = raw2;
+
+    bool c1 = (raw1 <= 4 || raw1 >= 4091);
+    bool c2 = (raw2 <= 4 || raw2 >= 4091);
+    if (c1) s1_clips++;
+    if (c2) s2_clips++;
+    if (c1 || c2) clipped++;
+
+    if (i == 0) {
+      prevRaw1 = raw1;
+      prevRaw2 = raw2;
+    }
+
+    // High-pass filter removes the DC offset sample-by-sample
+    y1 = 0.98f * (y1 + raw1 - prevRaw1);
+    y2 = 0.98f * (y2 + raw2 - prevRaw2);
+    prevRaw1 = raw1;
+    prevRaw2 = raw2;
+
+    signal1[i] = y1;
+    signal2[i] = y2;
+
+    if (i >= DISCARD_POINTS) {
+      sum1 += (double)y1 * y1;
+      sum2 += (double)y2 * y2;
+      used++;
+      if (i > DISCARD_POINTS) {
+        float d1 = y1 - previousY1;
+        float d2 = y2 - previousY2;
+        delta1 += (double)d1 * d1;
+        delta2 += (double)d2 * d2;
+        deltasUsed++;
+      }
+      previousY1 = y1;
+      previousY2 = y2;
+    }
   }
 
-  if (s1_energy < 10.0 || s2_energy < 10.0) return; // Signal too quiet for correlation
+  uint32_t duration_us = micros() - start_us;
 
-  double norm_denom = sqrt(s1_energy * s2_energy);
+  result.rms1 = (used > 0) ? sqrt(sum1 / used) : 0;
+  result.rms2 = (used > 0) ? sqrt(sum2 / used) : 0;
+  result.diff1 = (deltasUsed > 0) ? sqrt(delta1 / deltasUsed) : 0;
+  result.diff2 = (deltasUsed > 0) ? sqrt(delta2 / deltasUsed) : 0;
+  result.p2p1 = (float)(maxRaw1 - minRaw1);
+  result.p2p2 = (float)(maxRaw2 - minRaw2);
+  result.minRaw1 = minRaw1;
+  result.maxRaw1 = maxRaw1;
+  result.minRaw2 = minRaw2;
+  result.maxRaw2 = maxRaw2;
+  result.meanRaw1 = (float)sumRaw1 / (float)POINTS;
+  result.meanRaw2 = (float)sumRaw2 / (float)POINTS;
+  result.s1_clip_count = s1_clips;
+  result.s2_clip_count = s2_clips;
+  result.s1_clip_pct = ((float)s1_clips / (float)POINTS) * 100.0f;
+  result.s2_clip_pct = ((float)s2_clips / (float)POINTS) * 100.0f;
 
-  // Search lag range corresponding to max acoustic delay across 2.0 m pipe
-  // Acoustic delay max = 2.0m / 1200m/s = 1.67 ms. At 1000 Hz sample rate, 1.67 ms = ~2 samples.
-  int max_lag_samples = 8; 
+  result.late_count = late;
+  result.clipped_count = clipped;
+  result.effective_hz = (duration_us > 0) ? (2000.0f / (duration_us / 1000000.0f)) : 2500.0f;
+
+  // Rejection check: >5% clipped (100 samples) or >2% late (40 samples)
+  result.valid = (late <= POINTS / 50) && (clipped <= POINTS / 20);
+  return result;
+}
+
+void estimateDirection(Observation &o) {
+  float best = 0;
+  int bestLag = 0;
+  for (int lag = -MAX_LAG_SAMPLES; lag <= MAX_LAG_SAMPLES; ++lag) {
+    int start = lag < 0 ? -lag : 0;
+    int end = lag > 0 ? POINTS - lag : POINTS;
+    if (start < DISCARD_POINTS) start = DISCARD_POINTS;
+    double dot = 0, e1 = 0, e2 = 0;
+    for (int i = start; i < end; ++i) {
+      float a = signal1[i];
+      float b = signal2[i + lag];
+      dot += (double)a * b;
+      e1 += (double)a * a;
+      e2 += (double)b * b;
+    }
+    float corr = (e1 > 1e-8 && e2 > 1e-8) ? fabsf(dot / sqrt(e1 * e2)) : 0;
+    if (corr > best) {
+      best = corr;
+      bestLag = lag;
+    }
+  }
+  o.corr = best;
+  o.lag = bestLag;
+}
+
+// ============================================================================
+// HIGH-SPEED SYNCHRONIZED ACQUISITION & TDOA LOCALIZATION
+// ============================================================================
+
+const TDOAResult& captureHighSpeedTDOA() {
+  TDOAResult &res = s_tdoa_result;
+  memset(&res, 0, sizeof(TDOAResult));
+  res.sample_rate_hz = 10000;
+  res.uncertainty_m = 0.15f;
+  res.loc_valid = false;
+  strncpy(res.status, "LOCATION_UNAVAILABLE", sizeof(res.status) - 1);
+
+  printProgressMarker("TDOA_ACQ_START");
+  uint32_t start_us = micros();
+  uint32_t next_us = start_us;
+  int clip1 = 0, clip2 = 0;
+  long sum1 = 0, sum2 = 0;
+
+  for (int i = 0; i < TDOA_BURST_SAMPLES; ++i) {
+    while ((int32_t)(micros() - next_us) < 0) { }
+    next_us += TDOA_SAMPLE_INTERVAL_US;
+
+    int s1 = analogRead(PIN_S1);
+    int s2 = analogRead(PIN_S2);
+
+    s_tdoa_raw1[i] = (int16_t)s1;
+    s_tdoa_raw2[i] = (int16_t)s2;
+
+    if (s1 <= 4 || s1 >= 4091) clip1++;
+    if (s2 <= 4 || s2 >= 4091) clip2++;
+
+    sum1 += s1;
+    sum2 += s2;
+  }
+
+  uint32_t elapsed_us = micros() - start_us;
+  printProgressMarker("TDOA_ACQ_DONE", elapsed_us);
+  if (elapsed_us > 0) {
+    res.sample_rate_hz = (int)((float)TDOA_BURST_SAMPLES / ((float)elapsed_us / 1000000.0f) + 0.5f);
+  }
+
+  // Populate 50 downsampled snapshot points for web visualization
+  for (int j = 0; j < 50; ++j) {
+    int idx = j * 10;
+    res.s1_wave[j] = s_tdoa_raw1[idx] - (int16_t)(sum1 / TDOA_BURST_SAMPLES);
+    res.s2_wave[j] = s_tdoa_raw2[idx] - (int16_t)(sum2 / TDOA_BURST_SAMPLES);
+  }
+
+  // Quality check: Reject if excessive ADC clipping (>5% = 25 samples)
+  if (clip1 > 25 || clip2 > 25) {
+    res.loc_valid = false;
+    strncpy(res.status, "ADC_CLIPPING_FAULT", sizeof(res.status) - 1);
+    return res;
+  }
+
+  printProgressMarker("TDOA_FILTER_START");
+  // Zero-mean centering and digital high-pass filtering (300 Hz cutoff at 10 kHz fs: alpha = 0.8273)
+  float mean1 = (float)sum1 / TDOA_BURST_SAMPLES;
+  float mean2 = (float)sum2 / TDOA_BURST_SAMPLES;
+
+  float y1 = 0, y2 = 0;
+  double var1 = 0, var2 = 0;
+  // Exactly 300 Hz (-3 dB) cutoff for y[n] = alpha*(y[n-1] + x[n] - x[n-1]) at fs=10 kHz:
+  // Derived from cos(w_c) = 2*alpha / (1 + alpha^2) => alpha = (1 - sin(w_c)) / cos(w_c) = 0.8273f
+  constexpr float ALPHA_HP_10KHZ = 0.8273f;
+
+  for (int i = 0; i < TDOA_BURST_SAMPLES; ++i) {
+    float x1 = (float)s_tdoa_raw1[i] - mean1;
+    float x2 = (float)s_tdoa_raw2[i] - mean2;
+
+    y1 = ALPHA_HP_10KHZ * (y1 + x1 - (i > 0 ? (float)s_tdoa_raw1[i-1] - mean1 : x1));
+    y2 = ALPHA_HP_10KHZ * (y2 + x2 - (i > 0 ? (float)s_tdoa_raw2[i-1] - mean2 : x2));
+
+    s_tdoa_filt1[i] = y1;
+    s_tdoa_filt2[i] = y2;
+
+    var1 += (double)y1 * y1;
+    var2 += (double)y2 * y2;
+  }
+
+  var1 /= TDOA_BURST_SAMPLES;
+  var2 /= TDOA_BURST_SAMPLES;
+  printProgressMarker("TDOA_FILTER_DONE");
+
+  // Floor check: If variance < 4.0 ADC counts^2, signal is silent background noise
+  if (var1 < 4.0 || var2 < 4.0) {
+    res.loc_valid = false;
+    strncpy(res.status, "LOW_SIGNAL_POWER", sizeof(res.status) - 1);
+    return res;
+  }
+
+  printProgressMarker("TDOA_CORR_START");
+  // Normalized Cross-Correlation (NCC) across lags [-20, +20]
+  float best_r = -1.0f;
   int best_lag = 0;
-  double max_corr = -1.0;
 
-  for (int lag = -max_lag_samples; lag <= max_lag_samples; lag++) {
-    double r_12 = 0.0;
-    int count = 0;
+  for (int lag = -TDOA_MAX_SEARCH_LAG; lag <= TDOA_MAX_SEARCH_LAG; ++lag) {
+    int start = lag < 0 ? -lag : 0;
+    int end = lag > 0 ? TDOA_BURST_SAMPLES - lag : TDOA_BURST_SAMPLES;
+    double dot = 0, e1 = 0, e2 = 0;
 
-    for (int n = 0; n < SAMPLES_PER_SECOND; n++) {
-      int m = n + lag;
-      if (m >= 0 && m < SAMPLES_PER_SECOND) {
-        float x1 = g_s1_raw_window[n] - s1_m;
-        float x2 = g_s2_raw_window[m] - s2_m;
-        r_12 += x1 * x2;
-        count++;
-      }
+    for (int i = start; i < end; ++i) {
+      float a = s_tdoa_filt1[i];
+      float b = s_tdoa_filt2[i + lag];
+      dot += (double)a * b;
+      e1 += (double)a * a;
+      e2 += (double)b * b;
     }
-    double corr_coeff = r_12 / norm_denom;
-    if (corr_coeff > max_corr) {
-      max_corr = corr_coeff;
+
+    float norm = (e1 > 1e-8 && e2 > 1e-8) ? (float)(dot / sqrt(e1 * e2)) : 0.0f;
+    int arr_idx = lag + TDOA_MAX_SEARCH_LAG;
+    s_tdoa_r_vals[arr_idx] = norm;
+
+    if (norm > best_r) {
+      best_r = norm;
       best_lag = lag;
     }
   }
 
-  *peak_corr_out = (float)max_corr;
-  *tdoa_sec_out  = ((float)best_lag) / (float)SAMPLE_RATE_HZ;
+  res.peak_corr = best_r;
 
-  // Check validity conditions (Requirements: bandwidth/timing/correlation quality)
-  // At 1000 Hz sampling rate, 1 sample resolution = 1 ms (~1.2m error on 2m pipe).
-  // Cross-correlation is ONLY marked valid if correlation coefficient R > 0.65.
-  if (*peak_corr_out >= MIN_CORRELATION_PEAK) {
-    *valid_out = true;
+  // Compute Peak-to-Sidelobe Ratio (PSR)
+  double sidelobe_sum = 0, sidelobe_sq = 0;
+  int sidelobe_count = 0;
+  for (int lag = -TDOA_MAX_SEARCH_LAG; lag <= TDOA_MAX_SEARCH_LAG; ++lag) {
+    if (abs(lag - best_lag) > 2) {
+      float r = s_tdoa_r_vals[lag + TDOA_MAX_SEARCH_LAG];
+      sidelobe_sum += r;
+      sidelobe_sq += (double)r * r;
+      sidelobe_count++;
+    }
+  }
+
+  if (sidelobe_count > 0) {
+    double side_mean = sidelobe_sum / sidelobe_count;
+    double side_var = (sidelobe_sq / sidelobe_count) - (side_mean * side_mean);
+    double side_std = (side_var > 1e-6) ? sqrt(side_var) : 0.05;
+    res.psr = (float)((best_r - side_mean) / side_std);
   } else {
-    *valid_out = false;
+    res.psr = 1.0f;
+  }
+
+  // Sub-sample parabolic interpolation around peak
+  float sub_sample_delta = 0.0f;
+  int best_idx = best_lag + TDOA_MAX_SEARCH_LAG;
+  if (best_idx > 0 && best_idx < 2 * TDOA_MAX_SEARCH_LAG) {
+    float y_left = s_tdoa_r_vals[best_idx - 1];
+    float y_mid = s_tdoa_r_vals[best_idx];
+    float y_right = s_tdoa_r_vals[best_idx + 1];
+    float denom = 2.0f * (2.0f * y_mid - y_left - y_right);
+    if (fabsf(denom) > 1e-5f) {
+      sub_sample_delta = (y_right - y_left) / denom;
+      if (sub_sample_delta > 0.5f) sub_sample_delta = 0.5f;
+      if (sub_sample_delta < -0.5f) sub_sample_delta = -0.5f;
+    }
+  }
+
+  printProgressMarker("TDOA_CORR_DONE");
+
+  // Refined time delay in microseconds:
+  // With Sensor 2 sampled +10 us LATER than Sensor 1, an event arriving +10 us later
+  // at Sensor 2 produces lag = 0. To recover true physical dt = t2 - t1, we ADD tau_skew.
+  float refined_lag = (float)best_lag + sub_sample_delta;
+  res.delta_t_us = (refined_lag * (float)TDOA_SAMPLE_INTERVAL_US) + ADC_INTERCHANNEL_SKEW_ESTIMATE_US;
+
+  // Calculate distance from Sensor 1: d1 = (L - v * dt) / 2
+  float dt_sec = res.delta_t_us / 1000000.0f;
+  float d1 = (SENSOR_SPACING_M - (PIPE_PROPAGATION_VELOCITY_MPS * dt_sec)) / 2.0f;
+  float d2 = SENSOR_SPACING_M - d1;
+
+  res.dist_s1_m = d1;
+  res.dist_s2_m = d2;
+
+  // Physical plausibility & quality criteria
+  bool corr_ok = (best_r >= MIN_TDOA_CORRELATION);
+  bool psr_ok = (res.psr >= 2.0f);
+  bool range_ok = (d1 >= -0.15f && d1 <= (SENSOR_SPACING_M + 0.15f));
+
+  if (corr_ok && psr_ok && range_ok) {
+    res.loc_valid = true;
+    res.dist_s1_m = fmaxf(0.0f, fminf(SENSOR_SPACING_M, d1));
+    res.dist_s2_m = fmaxf(0.0f, fminf(SENSOR_SPACING_M, d2));
+    res.confidence_pct = roundf(best_r * 100.0f);
+    // Honest uncertainty bounds: uncalibrated velocity & steel wave dispersion preclude false centimeter claims
+    res.uncertainty_m = fmaxf(0.15f, (1.0f - best_r) * 0.6f);
+    strncpy(res.status, "LOCALIZATION_ACQUIRED", sizeof(res.status) - 1);
+  } else {
+    res.loc_valid = false;
+    strncpy(res.status, "INSUFFICIENT_CORRELATION", sizeof(res.status) - 1);
+  }
+
+  return res;
+}
+
+
+void printTDOATelemetry(const TDOAResult &t) {
+  Serial.printf("TDOA,%lu,%.1f,%.3f,%.2f,%.2f,%.2f,%d,%.1f,%d,%s\n",
+                millis(),
+                t.delta_t_us,
+                t.peak_corr,
+                t.psr,
+                t.dist_s1_m,
+                t.dist_s2_m,
+                t.sample_rate_hz,
+                PIPE_PROPAGATION_VELOCITY_MPS,
+                t.loc_valid ? 1 : 0,
+                t.status);
+
+  // Output compact waveform snapshot
+  Serial.print(F("WAVE,"));
+  for (int i = 0; i < 50; ++i) {
+    Serial.print(t.s1_wave[i]);
+    if (i < 49) Serial.print(F(","));
+  }
+  Serial.print(F(";"));
+  for (int i = 0; i < 50; ++i) {
+    Serial.print(t.s2_wave[i]);
+    if (i < 49) Serial.print(F(","));
+  }
+  Serial.println();
+}
+
+void printADCTelemetry(const Observation &o) {
+  // Format: ADC,millis,min1,max1,mean1,clips1,pct1,min2,max2,mean2,clips2,pct2
+  Serial.printf("ADC,%lu,%d,%d,%.1f,%d,%.2f,%d,%d,%.1f,%d,%.2f\n",
+                millis(),
+                o.minRaw1, o.maxRaw1, o.meanRaw1, o.s1_clip_count, o.s1_clip_pct,
+                o.minRaw2, o.maxRaw2, o.meanRaw2, o.s2_clip_count, o.s2_clip_pct);
+}
+
+// ============================================================================
+// DUAL YF-S201 FLOW SENSOR EVALUATION & CANDIDATE ACOUSTIC LOCK ASSOCIATION
+// ============================================================================
+
+void recordTDOAHistory(const TDOAResult &t) {
+  g_tdoa_history[g_tdoa_history_idx] = t;
+  g_tdoa_history_ts[g_tdoa_history_idx] = millis();
+  g_tdoa_history_idx = (g_tdoa_history_idx + 1) % TDOA_HISTORY_SIZE;
+  if (g_tdoa_history_count < TDOA_HISTORY_SIZE) {
+    g_tdoa_history_count++;
+  }
+}
+
+void associateCandidateTDOALock() {
+  // Search bounded TDOA history buffer (last 30 seconds)
+  // Associate candidate with highest peak_corr that occurred around or since the onset of flow imbalance.
+  // Prevents normal quiescent pump vibration prior to leak onset from being selected as a leak event.
+  float best_corr = -1.0f;
+  int best_idx = -1;
+
+  for (int i = 0; i < g_tdoa_history_count; ++i) {
+    const TDOAResult &cand = g_tdoa_history[i];
+    uint32_t ts = g_tdoa_history_ts[i];
+
+    if (cand.loc_valid && cand.peak_corr >= MIN_TDOA_CORRELATION) {
+      // Must be within candidate window starting from onset of flow imbalance (-2s tolerance for burst alignment)
+      if (g_flow_imbalance_onset_ms == 0 || (ts + 2000 >= g_flow_imbalance_onset_ms)) {
+        if (cand.peak_corr > best_corr) {
+          best_corr = cand.peak_corr;
+          best_idx = i;
+        }
+      }
+    }
+  }
+
+  if (best_idx >= 0) {
+    g_associated_tdoa_lock = g_tdoa_history[best_idx];
+    g_associated_tdoa_valid = true;
+  } else {
+    g_associated_tdoa_valid = false;
+  }
+}
+
+void printFlowTelemetry(const FlowResult &f) {
+  // Format: FLOW,millis,interval_ms,in_pulses,out_pulses,flow_in_lpm,flow_out_lpm,diff_lpm,progress,confirmed,status
+  Serial.printf("FLOW,%lu,%lu,%lu,%lu,%.3f,%.3f,%.3f,%d,%d,%s\n",
+                (unsigned long)f.esp32_ms,
+                (unsigned long)f.interval_ms,
+                (unsigned long)f.in_pulses,
+                (unsigned long)f.out_pulses,
+                f.flow_in_lpm,
+                f.flow_out_lpm,
+                f.flow_diff_lpm,
+                f.leak_progress,
+                f.leak_confirmed ? 1 : 0,
+                f.status);
+}
+
+void evaluateFlowSensors() {
+  uint32_t now = millis();
+  if (g_last_flow_calc_ms == 0) {
+    g_last_flow_calc_ms = now;
+    return;
+  }
+  uint32_t elapsed = now - g_last_flow_calc_ms;
+  if (elapsed < FLOW_WINDOW_MS) {
+    return;
+  }
+  g_last_flow_calc_ms = now;
+
+  portENTER_CRITICAL(&g_flow_mux);
+  uint32_t pIn = g_inlet_pulses;
+  uint32_t pOut = g_outlet_pulses;
+  g_inlet_pulses = 0;
+  g_outlet_pulses = 0;
+  portEXIT_CRITICAL(&g_flow_mux);
+
+  // Exact pulse-to-flow conversion:
+  // flow_lpm = (pulses * 60000.0) / (calibration_pulses_per_liter * actual_interval_ms)
+  float flowIn = (pIn * 60000.0f) / (FLOW_K_IN * (float)elapsed);
+  float flowOut = (pOut * 60000.0f) / (FLOW_K_OUT * (float)elapsed);
+  float difference = flowIn - flowOut;
+
+  g_latest_flow.esp32_ms = now;
+  g_latest_flow.interval_ms = elapsed;
+  g_latest_flow.in_pulses = pIn;
+  g_latest_flow.out_pulses = pOut;
+  g_latest_flow.flow_in_lpm = flowIn;
+  g_latest_flow.flow_out_lpm = flowOut;
+  g_latest_flow.flow_diff_lpm = difference;
+
+  // Rule: Do not assess leak when inlet flow is low or zero
+  if (flowIn < FLOW_MIN_INLET_LPM) {
+    g_flow_leak_count = 0;
+    g_flow_normal_count = 0;
+    g_flow_leak_alarm = false;
+    g_flow_imbalance_onset_ms = 0;
+    g_latest_flow.leak_progress = 0;
+    g_latest_flow.leak_confirmed = false;
+    strncpy(g_latest_flow.status, "LOW_OR_NO_FLOW", sizeof(g_latest_flow.status) - 1);
+    printFlowTelemetry(g_latest_flow);
+    return;
+  }
+
+  // Leak threshold evaluation with 3-window confirmation & 3-window recovery hysteresis
+  if (difference >= FLOW_LEAK_THRESHOLD_LPM) {
+    if (g_flow_leak_count == 0) {
+      g_flow_imbalance_onset_ms = now;
+    }
+
+    if (g_flow_leak_count < FLOW_CONFIRM_WINDOWS) {
+      g_flow_leak_count++;
+    }
+    g_flow_normal_count = 0;
+
+    if (g_flow_leak_count >= FLOW_CONFIRM_WINDOWS) {
+      g_flow_leak_alarm = true;
+      strncpy(g_latest_flow.status, "LEAK_CONFIRMED", sizeof(g_latest_flow.status) - 1);
+      // Associate with relevant valid candidate acoustic lock from imbalance onset
+      associateCandidateTDOALock();
+    } else {
+      strncpy(g_latest_flow.status, "VERIFYING_FLOW", sizeof(g_latest_flow.status) - 1);
+    }
+  } else {
+    g_flow_leak_count = 0;
+    if (g_flow_normal_count < FLOW_RECOVERY_WINDOWS) {
+      g_flow_normal_count++;
+    }
+    if (g_flow_normal_count >= FLOW_RECOVERY_WINDOWS) {
+      g_flow_leak_alarm = false;
+      g_associated_tdoa_valid = false;
+      g_flow_imbalance_onset_ms = 0;
+    }
+    strncpy(g_latest_flow.status, g_flow_leak_alarm ? "LEAK_CONFIRMED" : "NO_LEAK", sizeof(g_latest_flow.status) - 1);
+  }
+
+  g_latest_flow.leak_progress = g_flow_leak_count;
+  g_latest_flow.leak_confirmed = g_flow_leak_alarm;
+
+  printFlowTelemetry(g_latest_flow);
+}
+
+void printFlowDiagnostics() {
+  Serial.println(F("\n================ FLOW SENSOR HARDWARE DIAGNOSTIC ================"));
+  Serial.printf("Inlet Pin: GPIO %d | Outlet Pin: GPIO %d | K-factor: %.1f / %.1f P/L\n",
+                PIN_FLOW_IN, PIN_FLOW_OUT, FLOW_K_IN, FLOW_K_OUT);
+  Serial.printf("Inlet: %lu pulses (%.3f L/min) | Outlet: %lu pulses (%.3f L/min)\n",
+                (unsigned long)g_latest_flow.in_pulses, g_latest_flow.flow_in_lpm,
+                (unsigned long)g_latest_flow.out_pulses, g_latest_flow.flow_out_lpm);
+  Serial.printf("Differential: %.3f L/min | Threshold: %.2f L/min | Min Inlet: %.2f L/min\n",
+                g_latest_flow.flow_diff_lpm, FLOW_LEAK_THRESHOLD_LPM, FLOW_MIN_INLET_LPM);
+  Serial.printf("Confirmation Progress: %d/%d windows | Leak Alarm: %s | Status: %s\n",
+                g_latest_flow.leak_progress, FLOW_CONFIRM_WINDOWS,
+                g_latest_flow.leak_confirmed ? "CONFIRMED" : "NORMAL", g_latest_flow.status);
+  if (g_associated_tdoa_valid) {
+    Serial.printf("Associated Acoustic Lock: d1=%.2fm, d2=%.2fm, dt=%.1fus, Peak R=%.3f\n",
+                  g_associated_tdoa_lock.dist_s1_m, g_associated_tdoa_lock.dist_s2_m,
+                  g_associated_tdoa_lock.delta_t_us, g_associated_tdoa_lock.peak_corr);
+  } else {
+    Serial.println(F("Associated Acoustic Lock: NONE / WAITING FOR CONFIRMATION"));
+  }
+  Serial.println(F("=================================================================\n"));
+}
+
+
+// ============================================================================
+// BASELINE CALIBRATION & MONITORING
+// ============================================================================
+
+void calibrate() {
+  base.ready = false;
+  g_system_state = STATE_CALIBRATING;
+  printProgressMarker("CALIBRATION_START");
+  printMemoryDiagnostics("CALIB_START");
+
+  Serial.println(F("\n================================================="));
+  Serial.println(F("60-SECOND BASELINE CALIBRATION: PUMP ON, NO LEAK"));
+  Serial.println(F("Ensure pipeline is operating normally without tap/leak."));
+  Serial.println(F("================================================="));
+
+  int s1_clip_secs = 0;
+  int s2_clip_secs = 0;
+  int late_secs = 0;
+
+  for (int sec = 0; sec < SECONDS_PER_REPORT; ++sec) {
+    uint32_t startMs = millis();
+    if (sec == 0) printProgressMarker("RMS_CAPTURE_START");
+    uint32_t t_rms_start = micros();
+    Observation o = captureObservation();
+    uint32_t t_rms_dur = micros() - t_rms_start;
+    if (sec == 0) printProgressMarker("RMS_CAPTURE_DONE", t_rms_dur);
+
+    const TDOAResult& tdoa = captureHighSpeedTDOA();
+    minuteData[sec] = o;
+    g_last_obs = o;
+    g_total_seconds_elapsed++;
+
+    if (o.s1_clip_count > 100) s1_clip_secs++;
+    if (o.s2_clip_count > 100) s2_clip_secs++;
+    if (o.late_count > 40) late_secs++;
+
+    if (g_gps_enabled) readGPS();
+    handleSerialCommands();
+
+    if (g_csv_mode) {
+      Serial.printf("CSV,%lu,%lu,%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,0,0,%d,CALIBRATING\n",
+                    millis(), g_total_seconds_elapsed,
+                    o.rms1, o.p2p1, o.rms1 * o.rms1, o.diff1,
+                    o.rms2, o.p2p2, o.rms2 * o.rms2, o.diff2,
+                    (!o.valid || o.clipped_count > 0) ? 1 : 0);
+      printTDOATelemetry(tdoa);
+      printADCTelemetry(o);
+      if (g_gps_enabled) printGPSTelemetry();
+      recordTDOAHistory(tdoa);
+      evaluateFlowSensors();
+    } else if (g_verbose_mode) {
+      Serial.printf("[CALIBRATING %d/60] S1 RMS: %.2f P2P: %.1f | S2 RMS: %.2f P2P: %.1f [%s]\n",
+                    sec + 1, o.rms1, o.p2p1, o.rms2, o.p2p2, o.valid ? "OK" : "CLIPPED/INVALID");
+    }
+
+    if (sec == 0) {
+      printMemoryDiagnostics("CALIB_SEC_0_DONE");
+    }
+
+    uint32_t elapsedMs = millis() - startMs;
+    if (elapsedMs < 1000) {
+      delay(1000 - elapsedMs);
+    }
+  }
+
+  int n = 0;
+  for (int i = 0; i < SECONDS_PER_REPORT; ++i) {
+    if (!minuteData[i].valid) continue;
+    if (n < SECONDS_PER_REPORT) {
+      s_analysis_r1[n] = minuteData[i].rms1;
+      s_analysis_r2[n] = minuteData[i].rms2;
+      s_analysis_d1[n] = minuteData[i].diff1;
+      s_analysis_d2[n] = minuteData[i].diff2;
+      n++;
+    }
+  }
+
+  if (n < MIN_VALID_SECONDS) {
+    base.ready = false;
+    g_system_state = STATE_SENSOR_FAULT;
+    printProgressMarker("CALIBRATION_FAILED");
+    printMemoryDiagnostics("CALIB_FAILED");
+    Serial.println(F("\n================ CALIBRATION FAILED ================"));
+    Serial.printf("Accepted Valid Seconds: %d/60 (Minimum required: %d)\n", n, MIN_VALID_SECONDS);
+    Serial.println(F("REJECTION BREAKDOWN:"));
+    Serial.printf("  - Sensor 1 ADC Clipping (>5%% clipped): %d/60 seconds\n", s1_clip_secs);
+    Serial.printf("  - Sensor 2 ADC Clipping (>5%% clipped): %d/60 seconds\n", s2_clip_secs);
+    Serial.printf("  - Sample Timing Overruns (>2%% late):   %d/60 seconds\n", late_secs);
+    Serial.printf("Latest ADC Range: S1 [%d..%d] (Clips: %d) | S2 [%d..%d] (Clips: %d)\n",
+                  g_last_obs.minRaw1, g_last_obs.maxRaw1, g_last_obs.s1_clip_count,
+                  g_last_obs.minRaw2, g_last_obs.maxRaw2, g_last_obs.s2_clip_count);
+    Serial.println(F("HARDWARE DIAGNOSTIC ADVICE:"));
+    Serial.println(F("  1. Check 100k/100k voltage divider creating ~1.65V DC bias at GPIO 34 & 35."));
+    Serial.println(F("  2. Check 0.1uF AC coupling capacitor & 1M resistor across piezo element."));
+    Serial.println(F("  3. Check BAT54S dual Schottky clamping diodes to 3.3V and GND."));
+    Serial.println(F("Send 'B' command after correcting hardware to retry baseline calibration."));
+    Serial.println(F("====================================================\n"));
+    return;
+  }
+
+  base.thresholdRms1  = baselineLimit(s_analysis_r1, n, RMS_RATIO_LIMIT, MIN_RMS_RISE, base.rms1);
+  base.thresholdRms2  = baselineLimit(s_analysis_r2, n, RMS_RATIO_LIMIT, MIN_RMS_RISE, base.rms2);
+  base.thresholdDiff1 = baselineLimit(s_analysis_d1, n, DIFF_RATIO_LIMIT, MIN_DIFF_RISE, base.diff1);
+  base.thresholdDiff2 = baselineLimit(s_analysis_d2, n, DIFF_RATIO_LIMIT, MIN_DIFF_RISE, base.diff2);
+
+  if (base.rms1 < 1.0f || base.rms2 < 1.0f) {
+    Serial.println(F("CALIBRATION FAILED: one or both sensors have almost no AC signal. Send B to retry."));
+    g_system_state = STATE_SENSOR_FAULT;
+    printProgressMarker("CALIBRATION_FAILED");
+    printMemoryDiagnostics("CALIB_FAILED");
+    return;
+  }
+
+  base.ready = true;
+  g_system_state = STATE_MONITORING_NORMAL;
+  g_minute_number = 0;
+  printProgressMarker("CALIBRATION_COMPLETE");
+  printMemoryDiagnostics("CALIB_COMPLETE");
+  Serial.println(F("\n============ BASELINE READY ============"));
+  Serial.printf("S1 Normal RMS: %.2f (Thresh: %.2f) | DIFF: %.2f (Thresh: %.2f)\n",
+                base.rms1, base.thresholdRms1, base.diff1, base.thresholdDiff1);
+  Serial.printf("S2 Normal RMS: %.2f (Thresh: %.2f) | DIFF: %.2f (Thresh: %.2f)\n",
+                base.rms2, base.thresholdRms2, base.diff2, base.thresholdDiff2);
+  Serial.println(F("Entering 60-second real-time monitoring mode..."));
+}
+
+void analyzeMinute() {
+  memset(s_analysis_a1, 0, sizeof(s_analysis_a1));
+  memset(s_analysis_a2, 0, sizeof(s_analysis_a2));
+  int valid = 0, count1 = 0, count2 = 0, simultaneous = 0;
+  int leading1 = 0, leading2 = 0;
+  int strongCorrelation = 0;
+  int invalid = 0;
+
+  for (int i = 0; i < SECONDS_PER_REPORT; ++i) {
+    Observation &o = minuteData[i];
+    if (!o.valid) { invalid++; continue; }
+
+    if (valid < SECONDS_PER_REPORT) {
+      s_analysis_r1[valid] = o.rms1;
+      s_analysis_r2[valid] = o.rms2;
+      s_analysis_d1[valid] = o.diff1;
+      s_analysis_d2[valid] = o.diff2;
+      valid++;
+    }
+
+    s_analysis_a1[i] = o.high1;
+    s_analysis_a2[i] = o.high2;
+    if (s_analysis_a1[i]) count1++;
+    if (s_analysis_a2[i]) count2++;
+    if (s_analysis_a1[i] && s_analysis_a2[i]) {
+      simultaneous++;
+      if (o.corr >= MIN_CORRELATION) {
+        strongCorrelation++;
+        if (o.lag >= 2 && o.lag <= 6) leading1++;
+        if (o.lag <= -2 && o.lag >= -6) leading2++;
+      }
+    }
+  }
+
+  if (valid < MIN_VALID_SECONDS) {
+    g_system_state = STATE_SENSOR_FAULT;
+    printFull60SecondReport("INCONCLUSIVE - BAD SENSOR/SAMPLE QUALITY", valid, invalid,
+                           0, 0, 0, 0, count1, count2, simultaneous, strongCorrelation,
+                           leading1, leading2, "Excessive ADC clipping or timing overruns detected.");
+    return;
+  }
+
+  float medR1 = medianOf(s_analysis_r1, valid), medR2 = medianOf(s_analysis_r2, valid);
+  float medD1 = medianOf(s_analysis_d1, valid), medD2 = medianOf(s_analysis_d2, valid);
+  int longest1 = longestRun(s_analysis_a1), longest2 = longestRun(s_analysis_a2);
+
+  bool sustained1 = count1 >= g_persistence_req && longest1 >= MIN_CONTINUOUS_SECONDS &&
+                    (medR1 > base.thresholdRms1 || medD1 > base.thresholdDiff1);
+  bool sustained2 = count2 >= g_persistence_req && longest2 >= MIN_CONTINUOUS_SECONDS &&
+                    (medR2 > base.thresholdRms2 || medD2 > base.thresholdDiff2);
+
+  if (medR1 < 1 || medR2 < 1) {
+    g_system_state = STATE_SENSOR_FAULT;
+    printFull60SecondReport("SENSOR SIGNAL FAULT", valid, invalid,
+                           medR1, medR2, medD1, medD2, count1, count2, simultaneous, strongCorrelation,
+                           leading1, leading2, "Sensor disconnected or zero AC signal.");
+    return;
+  }
+
+  if (sustained1 || sustained2) {
+    g_system_state = STATE_CONFIRMED_LEAK_ALARM;
+    String reasoning = "SUSTAINED ANOMALY DETECTED: ";
+    if (sustained1 && sustained2) {
+      reasoning += "Both S1 and S2 show continuous vibration elevation (>=" + String(g_persistence_req) + "/60s).";
+    } else if (sustained1) {
+      reasoning += "Sensor 1 elevated (" + String(count1) + "/60s) while Sensor 2 near baseline.";
+    } else {
+      reasoning += "Sensor 2 elevated (" + String(count2) + "/60s) while Sensor 1 near baseline.";
+    }
+
+    printFull60SecondReport("SUSTAINED VIBRATION ANOMALY / POSSIBLE LEAK", valid, invalid,
+                           medR1, medR2, medD1, medD2, count1, count2, simultaneous, strongCorrelation,
+                           leading1, leading2, reasoning.c_str());
+  } else if (count1 >= INTERMITTENT_SECONDS || count2 >= INTERMITTENT_SECONDS) {
+    g_system_state = STATE_SUSPECTED_ANOMALY;
+    printFull60SecondReport("INTERMITTENT VIBRATION CHANGE", valid, invalid,
+                           medR1, medR2, medD1, medD2, count1, count2, simultaneous, strongCorrelation,
+                           leading1, leading2, "Short-duration spikes or pump speed fluctuation detected.");
+  } else {
+    g_system_state = STATE_MONITORING_NORMAL;
+    printFull60SecondReport("NORMAL", valid, invalid,
+                           medR1, medR2, medD1, medD2, count1, count2, simultaneous, strongCorrelation,
+                           leading1, leading2, "Vibration levels within normal baseline statistical bounds.");
   }
 }
 
 // ============================================================================
-// SERIAL COMMAND INTERFACE & REPORTING
+// GPS PARSER & TELEMETRY
+// ============================================================================
+
+void readGPS() {
+  while (Serial2.available() > 0) {
+    char c = Serial2.read();
+    if (c == '\r' || c == '\n') {
+      if (g_nmea_buf_idx > 0) {
+        g_nmea_line_buf[g_nmea_buf_idx] = '\0';
+        parseNMEASentence(g_nmea_line_buf);
+        g_nmea_buf_idx = 0;
+      }
+    } else if (g_nmea_buf_idx < sizeof(g_nmea_line_buf) - 1) {
+      g_nmea_line_buf[g_nmea_buf_idx++] = c;
+    }
+  }
+}
+
+void parseNMEASentence(char* line) {
+  if (strncmp(line, "$GPRMC", 6) == 0 || strncmp(line, "$GNRMC", 6) == 0) {
+    char* tokens[15];
+    uint8_t count = 0;
+    char* p = line;
+    tokens[count++] = p;
+    while (*p && count < 15) {
+      if (*p == ',') {
+        *p = '\0';
+        tokens[count++] = p + 1;
+      }
+      p++;
+    }
+    if (count >= 7) {
+      char status = tokens[2][0];
+      if (status == 'A') {
+        float lat_raw = atof(tokens[3]);
+        char lat_ns = tokens[4][0];
+        float lon_raw = atof(tokens[5]);
+        char lon_ew = tokens[6][0];
+
+        int lat_deg = (int)(lat_raw / 100);
+        float lat_min = lat_raw - (lat_deg * 100);
+        float lat_dec = lat_deg + (lat_min / 60.0f);
+        if (lat_ns == 'S') lat_dec = -lat_dec;
+
+        int lon_deg = (int)(lon_raw / 100);
+        float lon_min = lon_raw - (lon_deg * 100);
+        float lon_dec = lon_deg + (lon_min / 60.0f);
+        if (lon_ew == 'W') lon_dec = -lon_dec;
+
+        if (lat_dec != 0.0f || lon_dec != 0.0f) {
+          g_gps_lat = lat_dec;
+          g_gps_lon = lon_dec;
+          g_gps_has_fix = true;
+          g_last_gps_fix_ms = millis();
+        }
+      } else if (status == 'V') {
+        if (g_gps_has_fix && (millis() - g_last_gps_fix_ms > 10000)) {
+          g_gps_has_fix = false;
+        }
+      }
+    }
+  } else if (strncmp(line, "$GPGGA", 6) == 0 || strncmp(line, "$GNGGA", 6) == 0) {
+    char* tokens[15];
+    uint8_t count = 0;
+    char* p = line;
+    tokens[count++] = p;
+    while (*p && count < 15) {
+      if (*p == ',') {
+        *p = '\0';
+        tokens[count++] = p + 1;
+      }
+      p++;
+    }
+    if (count >= 9) {
+      int fix_quality = atoi(tokens[6]);
+      int sats = atoi(tokens[7]);
+      float hdop = atof(tokens[8]);
+
+      g_gps_sats = (uint8_t)sats;
+      if (hdop > 0.01f) g_gps_hdop = hdop;
+
+      if (fix_quality > 0) {
+        float lat_raw = atof(tokens[2]);
+        char lat_ns = tokens[3][0];
+        float lon_raw = atof(tokens[4]);
+        char lon_ew = tokens[5][0];
+
+        int lat_deg = (int)(lat_raw / 100);
+        float lat_min = lat_raw - (lat_deg * 100);
+        float lat_dec = lat_deg + (lat_min / 60.0f);
+        if (lat_ns == 'S') lat_dec = -lat_dec;
+
+        int lon_deg = (int)(lon_raw / 100);
+        float lon_min = lon_raw - (lon_deg * 100);
+        float lon_dec = lon_deg + (lon_min / 60.0f);
+        if (lon_ew == 'W') lon_dec = -lon_dec;
+
+        if (lat_dec != 0.0f || lon_dec != 0.0f) {
+          g_gps_lat = lat_dec;
+          g_gps_lon = lon_dec;
+          g_gps_has_fix = true;
+          g_last_gps_fix_ms = millis();
+        }
+      }
+    }
+  }
+}
+
+void printGPSTelemetry() {
+  uint32_t fix_age = g_gps_has_fix ? (millis() - g_last_gps_fix_ms) : 999999;
+  const char* fix_str = "NO_FIX";
+  if (g_gps_has_fix) {
+    fix_str = (fix_age > 10000) ? "STALE" : "FIX";
+  }
+  Serial.printf("GPS,%.6f,%.6f,%u,%.2f,%lu,%s\n",
+                g_gps_lat, g_gps_lon, (unsigned int)g_gps_sats, g_gps_hdop,
+                (unsigned long)fix_age, fix_str);
+}
+
+// ============================================================================
+// DIAGNOSTICS & REPORTING
+// ============================================================================
+
+void printADCDiagnostics() {
+  Serial.println(F("\n================ ADC HARDWARE DIAGNOSTIC SNAPSHOT ================"));
+  Serial.printf("GPS Reading: %s | Total Run Time: %lu sec | Eff Rate: %.1f Hz\n",
+                g_gps_enabled ? "ENABLED" : "DISABLED", g_total_seconds_elapsed, g_last_obs.effective_hz);
+  Serial.printf("S1 ADC (GPIO 34): Mean=%6.1f | Min=%4d | Max=%4d | P2P=%4.0f | Clips=%4d (%4.1f%%) | RMS=%6.1f %s\n",
+                g_last_obs.meanRaw1, g_last_obs.minRaw1, g_last_obs.maxRaw1, g_last_obs.p2p1,
+                g_last_obs.s1_clip_count, g_last_obs.s1_clip_pct, g_last_obs.rms1,
+                (g_last_obs.s1_clip_count > 0) ? "[CLIPPED/SATURATED]" : "[OK]");
+  Serial.printf("S2 ADC (GPIO 35): Mean=%6.1f | Min=%4d | Max=%4d | P2P=%4.0f | Clips=%4d (%4.1f%%) | RMS=%6.1f %s\n",
+                g_last_obs.meanRaw2, g_last_obs.minRaw2, g_last_obs.maxRaw2, g_last_obs.p2p2,
+                g_last_obs.s2_clip_count, g_last_obs.s2_clip_pct, g_last_obs.rms2,
+                (g_last_obs.s2_clip_count > 0) ? "[CLIPPED/SATURATED]" : "[OK]");
+  printMemoryDiagnostics("ADC_SNAPSHOT");
+  Serial.println(F("------------------------------------------------------------------\n"));
+}
+
+void printStatusReport() {
+  Serial.println(F("\n================ SYSTEM STATUS REPORT ================"));
+  Serial.printf("State: %s | Total Run Time: %lu sec\n",
+                (g_system_state == STATE_CALIBRATING) ? "CALIBRATING" :
+                (g_system_state == STATE_MONITORING_NORMAL) ? "MONITORING_NORMAL" :
+                (g_system_state == STATE_SUSPECTED_ANOMALY) ? "SUSPECTED_ANOMALY" :
+                (g_system_state == STATE_CONFIRMED_LEAK_ALARM) ? "CONFIRMED_LEAK_ALARM" : "SENSOR_FAULT",
+                g_total_seconds_elapsed);
+  Serial.printf("Persistence Threshold: %u / 60 seconds\n", g_persistence_req);
+
+  if (base.ready) {
+    Serial.printf("S1 Normal RMS: %.2f | Thresh: %.2f | DIFF: %.2f\n", base.rms1, base.thresholdRms1, base.diff1);
+    Serial.printf("S2 Normal RMS: %.2f | Thresh: %.2f | DIFF: %.2f\n", base.rms2, base.thresholdRms2, base.diff2);
+  } else {
+    Serial.println(F("Baseline: NOT YET CALIBRATED / FAULT"));
+  }
+  printMemoryDiagnostics("STATUS_QUERY");
+  Serial.println(F("======================================================\n"));
+}
+
+void printFull60SecondReport(const char* state_str, int valid, int invalid,
+                             float medR1, float medR2, float medD1, float medD2,
+                             int count1, int count2, int simultaneous,
+                             int strongCorr, int lead1, int lead2,
+                             const char* reasoning) {
+  Serial.println(F("\n================================================================================"));
+  Serial.printf("           FULL 60-SECOND MONITORING REPORT #%lu\n", g_minute_number);
+  Serial.println(F("================================================================================"));
+  Serial.printf("FINAL DECISION:        [%s]\n", state_str);
+  Serial.printf("REASONING:             %s\n", reasoning);
+  Serial.printf("VALID SECONDS:         %d/60 | Invalid: %d\n", valid, invalid);
+  Serial.println(F("--------------------------------------------------------------------------------"));
+  Serial.printf("S1: Median RMS %5.1f (x%.2f baseline) | DIFF %5.1f | Abnormal %d/60s\n",
+                medR1, base.rms1 > 0 ? medR1 / base.rms1 : 1.0f, medD1, count1);
+  Serial.printf("S2: Median RMS %5.1f (x%.2f baseline) | DIFF %5.1f | Abnormal %d/60s\n",
+                medR2, base.rms2 > 0 ? medR2 / base.rms2 : 1.0f, medD2, count2);
+  Serial.printf("Simultaneous abnormal seconds: %d/60\n", simultaneous);
+  Serial.printf("Correlated windows: %d | S1 leads: %d | S2 leads: %d\n", strongCorr, lead1, lead2);
+  Serial.println(F("================================================================================\n"));
+}
+
+// ============================================================================
+// SERIAL COMMAND INTERFACE
 // ============================================================================
 
 void handleSerialCommands() {
@@ -680,19 +1267,21 @@ void handleSerialCommands() {
     if (cmd == "H" || cmd == "HELP") {
       printHelp();
     } else if (cmd == "B" || cmd == "CAL") {
-      if (g_system_state == STATE_CONFIRMED_LEAK_ALARM) {
-        Serial.println(F("\n[WARNING] Cannot recalibrate baseline while in CONFIRMED LEAK ALARM state. Confirm pipeline is leak-free first!"));
-      } else {
-        Serial.println(F("\n[COMMAND] Manual Baseline Recalibration Triggered."));
-        g_system_state = STATE_CALIBRATING;
-        g_cal_index = 0;
-      }
+      Serial.println(F("\n[COMMAND] Manual Baseline Recalibration Triggered."));
+      calibrate();
     } else if (cmd == "V" || cmd == "VERBOSE") {
       g_verbose_mode = !g_verbose_mode;
       Serial.printf("[COMMAND] Live Verbose Diagnostic Output: %s\n", g_verbose_mode ? "ENABLED" : "DISABLED");
     } else if (cmd == "M" || cmd == "MODE") {
       g_csv_mode = !g_csv_mode;
       Serial.printf("[COMMAND] Serial Output Format: %s\n", g_csv_mode ? "MACHINE CSV" : "HUMAN READABLE");
+    } else if (cmd == "G" || cmd == "GPS") {
+      g_gps_enabled = !g_gps_enabled;
+      Serial.printf("[COMMAND] GPS Processing: %s\n", g_gps_enabled ? "ENABLED" : "DISABLED");
+    } else if (cmd == "D" || cmd == "DIAG") {
+      printADCDiagnostics();
+    } else if (cmd == "F" || cmd == "FLOW") {
+      printFlowDiagnostics();
     } else if (cmd == "S" || cmd == "STATUS") {
       printStatusReport();
     } else if (cmd.startsWith("P ") || cmd.startsWith("PARAM ")) {
@@ -700,125 +1289,144 @@ void handleSerialCommands() {
       int val = cmd.substring(space_idx + 1).toInt();
       if (val >= 10 && val <= 60) {
         g_persistence_req = val;
-        Serial.printf("[COMMAND] Updated Persistence Threshold to %d out of 60 seconds.\n", g_persistence_req);
-      } else {
-        Serial.println(F("[ERROR] Invalid persistence parameter. Must be between 10 and 60 seconds."));
+        Serial.printf("[COMMAND] Persistence Threshold updated to %d/60 seconds.\n", g_persistence_req);
       }
-    } else if (cmd.length() > 0) {
-      Serial.printf("[ERROR] Unknown command '%s'. Type 'H' or 'HELP' for menu.\n", cmd.c_str());
     }
   }
 }
 
 void printHelp() {
   Serial.println(F("\n=================== SERIAL COMMAND MENU ==================="));
-  Serial.println(F("  H or HELP      - Display this help menu"));
-  Serial.println(F("  B or CAL       - Perform 60-sec baseline recalibration (Only when leak-free)"));
+  Serial.println(F("  H or HELP      - Display command menu"));
+  Serial.println(F("  B or CAL       - Perform 60-sec baseline recalibration"));
   Serial.println(F("  V or VERBOSE   - Toggle 1-second live preliminary diagnostics"));
-  Serial.println(F("  M or MODE      - Toggle output mode (Human-Readable vs CSV Machine format)"));
-  Serial.println(F("  S or STATUS    - Display current baseline calibration & system metrics"));
-  Serial.println(F("  P <10-60>      - Set persistence threshold seconds (Default: 42/60)"));
+  Serial.println(F("  M or MODE      - Toggle output mode (Human-Readable vs CSV)"));
+  Serial.println(F("  G or GPS       - Toggle GPS UART2 reading"));
+  Serial.println(F("  D or DIAG      - Print ADC hardware diagnostic snapshot"));
+  Serial.println(F("  F or FLOW      - Print flow sensor diagnostics & pulse counts"));
+  Serial.println(F("  S or STATUS    - Display system status & calibration metrics"));
+  Serial.println(F("  P <10-60>      - Set persistence threshold seconds"));
   Serial.println(F("===========================================================\n"));
 }
 
-void printStatusReport() {
-  Serial.println(F("\n================ SYSTEM STATUS REPORT ================"));
-  Serial.printf("State: %s | Total Run Time: %lu sec\n", 
-                (g_system_state == STATE_STABILIZING) ? "STABILIZING" :
-                (g_system_state == STATE_CALIBRATING) ? "CALIBRATING" :
-                (g_system_state == STATE_MONITORING_NORMAL) ? "MONITORING_NORMAL" :
-                (g_system_state == STATE_SUSPECTED_ANOMALY) ? "SUSPECTED_ANOMALY" :
-                (g_system_state == STATE_CONFIRMED_LEAK_ALARM) ? "CONFIRMED_LEAK_ALARM" : "SENSOR_FAULT",
-                g_total_seconds_elapsed);
-  Serial.printf("Sampling Rate: %d Hz | Timing Overruns: %lu\n", SAMPLE_RATE_HZ, g_timing_overrun_count);
-  Serial.printf("Persistence Threshold: %u / 60 seconds\n", g_persistence_req);
-
-  if (g_baseline.is_calibrated) {
-    Serial.printf("S1 Baseline RMS Med: %.2f | MAD: %.2f | Threshold: %.2f\n",
-                  g_baseline.s1_rms_median, g_baseline.s1_rms_mad, g_baseline.s1_rms_thresh);
-    Serial.printf("S2 Baseline RMS Med: %.2f | MAD: %.2f | Threshold: %.2f\n",
-                  g_baseline.s2_rms_median, g_baseline.s2_rms_mad, g_baseline.s2_rms_thresh);
-  } else {
-    Serial.println(F("Baseline: NOT YET CALIBRATED"));
-  }
-  Serial.println(F("======================================================\n"));
-}
-
-void printFull60SecondReport(const char* state_str, uint16_t s1_abn, uint16_t s2_abn, 
-                             uint16_t s1_max_seq, uint16_t s2_max_seq, 
-                             float s1_med_rms, float s2_med_rms,
-                             float s1_var_ratio, float s2_var_ratio,
-                             float tdoa_sec, float peak_corr, bool loc_valid,
-                             const char* reasoning) {
-  
-  Serial.println(F("\n================================================================================"));
-  Serial.printf("           60-SECOND PIPELINE MONITORING REPORT (Window #%lu)\n", g_total_seconds_elapsed / ANALYSIS_WINDOW_SEC);
-  Serial.println(F("================================================================================"));
-  Serial.printf("FINAL DECISION:        [%s]\n", state_str);
-  Serial.printf("DECISION REASONING:    %s\n", reasoning);
-  Serial.println(F("--------------------------------------------------------------------------------"));
-  Serial.println(F("METRIC                     | SENSOR 1 (GPIO 34)       | SENSOR 2 (GPIO 35)       "));
-  Serial.println(F("---------------------------+--------------------------+-------------------------"));
-  Serial.printf("Baseline RMS Median        | %-24.2f | %-24.2f\n", g_baseline.s1_rms_median, g_baseline.s2_rms_median);
-  Serial.printf("Dynamic Threshold          | %-24.2f | %-24.2f\n", g_baseline.s1_rms_thresh, g_baseline.s2_rms_thresh);
-  Serial.printf("60s Window RMS Median      | %-24.2f | %-24.2f\n", s1_med_rms, s2_med_rms);
-  Serial.printf("Vibration Increase Ratio   | %-24.2fx| %-24.2fx\n", 
-                g_baseline.s1_rms_median > 0 ? (s1_med_rms / g_baseline.s1_rms_median) : 1.0f,
-                g_baseline.s2_rms_median > 0 ? (s2_med_rms / g_baseline.s2_rms_median) : 1.0f);
-  Serial.printf("Abnormal Seconds Count     | %-24u | %-24u\n", s1_abn, s2_abn);
-  Serial.printf("Abnormal Percentage        | %-23.1f%% | %-23.1f%%\n", (s1_abn/60.0f)*100.0f, (s2_abn/60.0f)*100.0f);
-  Serial.printf("Max Consecutive Sequence   | %-24u | %-24u\n", s1_max_seq, s2_max_seq);
-  Serial.printf("Noise Variability (std/mean)| %-24.2f | %-24.2f\n", s1_var_ratio, s2_var_ratio);
-  Serial.println(F("--------------------------------------------------------------------------------"));
-
-  // Localization Section (Honest Uncertainty Enforcement)
-  if (loc_valid) {
-    float loc_s1_meters = (PIPE_LENGTH_METERS + (ACOUSTIC_SPEED_MPS * tdoa_sec)) / 2.0f;
-    Serial.printf("LOCALIZATION RESULT:    ESTIMATED DISTANCE = %.2f meters from Sensor 1 (Cross-Corr Peak R=%.2f)\n", 
-                  loc_s1_meters, peak_corr);
-  } else {
-    Serial.printf("LOCALIZATION RESULT:    LOCATION NOT VERIFIED\n");
-    Serial.printf("LOCALIZATION REASON:    Peak Cross-Correlation R=%.2f (Min required: %.2f) or sampling interval (1ms) insufficient for 2m acoustic delay.\n",
-                  peak_corr, MIN_CORRELATION_PEAK);
-  }
-  Serial.printf("TIMING PERFORMANCE:     Sample Rate: %d Hz | Timing Overruns: %lu\n", SAMPLE_RATE_HZ, g_timing_overrun_count);
-  Serial.println(F("================================================================================\n"));
-}
-
 // ============================================================================
-// MATHEMATICAL & STATISTICAL HELPERS
+// ARDUINO SETUP & MAIN LOOP
 // ============================================================================
 
-float calculateMedian(float* array, uint16_t size) {
-  if (size == 0) return 0.0f;
-  // Simple insertion sort on a copy array
-  float temp[60];
-  uint16_t n = min(size, (uint16_t)60);
-  for (uint16_t i = 0; i < n; i++) temp[i] = array[i];
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(20); // Prevent 1000ms blocking timeout on partial serial commands
+  while (!Serial && millis() < 3000);
 
-  for (uint16_t i = 1; i < n; i++) {
-    float key = temp[i];
-    int j = i - 1;
-    while (j >= 0 && temp[j] > key) {
-      temp[j + 1] = temp[j];
-      j--;
+  Serial2.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_S1, ADC_11db);
+  analogSetPinAttenuation(PIN_S2, ADC_11db);
+
+  pinMode(PIN_FLOW_IN, INPUT_PULLUP);
+  pinMode(PIN_FLOW_OUT, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_FLOW_IN), flowInletISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_FLOW_OUT), flowOutletISR, FALLING);
+
+  Serial.println(F("\nESP32 PIPELINE MONITOR - RESTORED PRE-GPS DSP ARCHITECTURE"));
+  Serial.printf("Steel Pipe | Sensor separation: %.2f m\n", SENSOR_SPACING_M);
+  Serial.println(F("Sensor 1 -> GPIO 34 | Sensor 2 -> GPIO 35"));
+  Serial.printf("Flow Meters -> Inlet GPIO %d, Outlet GPIO %d (YF-S201, 450 P/L)\n", PIN_FLOW_IN, PIN_FLOW_OUT);
+  Serial.printf("GPS UART2 -> RX GPIO %d, TX GPIO %d @ %d Baud\n", PIN_GPS_RX, PIN_GPS_TX, GPS_BAUD);
+  printMemoryDiagnostics("BOOT_SETUP");
+  Serial.println(F("Starting initial 60-second baseline calibration..."));
+
+  delay(2000);
+  calibrate();
+}
+
+void loop() {
+  handleSerialCommands();
+
+  // CONTINUOUS TELEMETRY STREAMING: Never stop outputting 1-second CSV telemetry even if uncalibrated/faulted
+  if (!base.ready) {
+    uint32_t startMs = millis();
+    Observation o = captureObservation();
+    const TDOAResult& tdoa = captureHighSpeedTDOA();
+    g_last_obs = o;
+    g_total_seconds_elapsed++;
+
+    if (g_gps_enabled) readGPS();
+    handleSerialCommands();
+
+    const char* statusStr = (g_system_state == STATE_CALIBRATING) ? "CALIBRATING" :
+                            (!o.valid || o.clipped_count > 0) ? "ADC_CLIPPING_FAULT" : "CALIBRATION_FAILED";
+
+    if (g_csv_mode) {
+      Serial.printf("CSV,%lu,%lu,%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,0,0,1,%s\n",
+                    millis(), g_total_seconds_elapsed,
+                    o.rms1, o.p2p1, o.rms1 * o.rms1, o.diff1,
+                    o.rms2, o.p2p2, o.rms2 * o.rms2, o.diff2,
+                    statusStr);
+      printTDOATelemetry(tdoa);
+      printADCTelemetry(o);
+      if (g_gps_enabled) printGPSTelemetry();
+      recordTDOAHistory(tdoa);
+      evaluateFlowSensors();
+    } else if (g_verbose_mode) {
+      Serial.printf("[DIAG %s] S1 RMS: %5.1f P2P: %5.1f | S2 RMS: %5.1f P2P: %5.1f [%s]\n",
+                    (g_system_state == STATE_CALIBRATING) ? "CALIBRATING" : "FAULT",
+                    o.rms1, o.p2p1, o.rms2, o.p2p2, statusStr);
     }
-    temp[j + 1] = key;
+
+    uint32_t elapsedMs = millis() - startMs;
+    if (elapsedMs < 1000) {
+      delay(1000 - elapsedMs);
+    }
+    return;
   }
 
-  if (n % 2 == 1) {
-    return temp[n / 2];
-  } else {
-    return (temp[(n / 2) - 1] + temp[n / 2]) / 2.0f;
-  }
-}
+  // Normal 60-Second Monitoring Loop
+  for (int sec = 0; sec < SECONDS_PER_REPORT; ++sec) {
+    uint32_t startMs = millis();
+    Observation o = captureObservation();
+    const TDOAResult& tdoa = captureHighSpeedTDOA();
 
-float calculateMAD(float* array, uint16_t size, float median) {
-  if (size == 0) return 0.0f;
-  float abs_diffs[60];
-  uint16_t n = min(size, (uint16_t)60);
-  for (uint16_t i = 0; i < n; i++) {
-    abs_diffs[i] = fabsf(array[i] - median);
+    o.high1 = (o.rms1 > base.thresholdRms1) || (o.diff1 > base.thresholdDiff1);
+    o.high2 = (o.rms2 > base.thresholdRms2) || (o.diff2 > base.thresholdDiff2);
+    if (o.high1 && o.high2) {
+      estimateDirection(o);
+    }
+    minuteData[sec] = o;
+    g_last_obs = o;
+    g_total_seconds_elapsed++;
+
+    if (g_gps_enabled) readGPS();
+    handleSerialCommands();
+
+    const char* statusStr = !o.valid ? "ADC_CLIPPING_FAULT" :
+                            (o.high1 || o.high2) ? "PRELIM_ABNORMAL" : "PRELIM_NORMAL";
+
+    if (g_csv_mode) {
+      Serial.printf("CSV,%lu,%lu,%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%s\n",
+                    millis(), g_total_seconds_elapsed,
+                    o.rms1, o.p2p1, o.rms1 * o.rms1, o.diff1,
+                    o.rms2, o.p2p2, o.rms2 * o.rms2, o.diff2,
+                    o.high1 ? 1 : 0, o.high2 ? 1 : 0,
+                    (!o.valid || o.clipped_count > 0) ? 1 : 0,
+                    statusStr);
+      printTDOATelemetry(tdoa);
+      printADCTelemetry(o);
+      if (g_gps_enabled) printGPSTelemetry();
+      recordTDOAHistory(tdoa);
+      evaluateFlowSensors();
+    } else if (g_verbose_mode) {
+      Serial.printf("[LIVE-DIAG %02d/60] S1 RMS: %5.1f (Th: %5.1f) | S2 RMS: %5.1f (Th: %5.1f) [%s]\n",
+                    sec + 1, o.rms1, base.thresholdRms1, o.rms2, base.thresholdRms2, statusStr);
+    }
+
+    uint32_t elapsedMs = millis() - startMs;
+    if (elapsedMs < 1000) {
+      delay(1000 - elapsedMs);
+    }
   }
-  return calculateMedian(abs_diffs, n);
+
+  ++g_minute_number;
+  analyzeMinute();
 }
